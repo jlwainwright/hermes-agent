@@ -39,7 +39,9 @@ custom OpenAI-compatible endpoint without touching the main model settings.
 import json
 import logging
 import os
-from pathlib import Path
+import threading
+import time
+from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,9 +56,13 @@ logger = logging.getLogger(__name__)
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
-    "minimax": "MiniMax-M2.5-highspeed",
-    "minimax-cn": "MiniMax-M2.5-highspeed",
+    "minimax": "MiniMax-M2.7-highspeed",
+    "minimax-cn": "MiniMax-M2.7-highspeed",
     "anthropic": "claude-haiku-4-5-20251001",
+    "ai-gateway": "google/gemini-3-flash",
+    "opencode-zen": "gemini-3-flash",
+    "opencode-go": "glm-5",
+    "kilocode": "google/gemini-3-flash-preview",
 }
 
 # OpenRouter app attribution headers
@@ -76,7 +82,7 @@ auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
 _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
-_NOUS_MODEL = "gemini-3-flash"
+_NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -320,9 +326,10 @@ class AsyncCodexAuxiliaryClient:
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
-    def __init__(self, real_client: Any, model: str):
+    def __init__(self, real_client: Any, model: str, is_oauth: bool = False):
         self._client = real_client
         self._model = model
+        self._is_oauth = is_oauth
 
     def create(self, **kwargs) -> Any:
         from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
@@ -351,6 +358,7 @@ class _AnthropicCompletionsAdapter:
             max_tokens=max_tokens,
             reasoning_config=None,
             tool_choice=normalized_tool_choice,
+            is_oauth=self._is_oauth,
         )
         if temperature is not None:
             anthropic_kwargs["temperature"] = temperature
@@ -389,9 +397,9 @@ class _AnthropicChatShim:
 class AnthropicAuxiliaryClient:
     """OpenAI-client-compatible wrapper over a native Anthropic client."""
 
-    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str):
+    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
         self._real_client = real_client
-        adapter = _AnthropicCompletionsAdapter(real_client, model)
+        adapter = _AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth)
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
         self.base_url = base_url
@@ -458,15 +466,30 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid Codex OAuth access token from Hermes auth store (~/.hermes/auth.json)."""
+    """Read a valid, non-expired Codex OAuth access token from Hermes auth store."""
     try:
         from hermes_cli.auth import _read_codex_tokens
         data = _read_codex_tokens()
         tokens = data.get("tokens", {})
         access_token = tokens.get("access_token")
-        if isinstance(access_token, str) and access_token.strip():
-            return access_token.strip()
-        return None
+        if not isinstance(access_token, str) or not access_token.strip():
+            return None
+
+        # Check JWT expiry — expired tokens block the auto chain and
+        # prevent fallback to working providers (e.g. Anthropic).
+        try:
+            import base64
+            payload = access_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp", 0)
+            if exp and time.time() > exp:
+                logger.debug("Codex access token expired (exp=%s), skipping", exp)
+                return None
+        except Exception:
+            pass  # Non-JWT token or decode error — use as-is
+
+        return access_token.strip()
     except Exception as exc:
         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
         return None
@@ -475,11 +498,11 @@ def _read_codex_access_token() -> Optional[str]:
 def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Try each API-key provider in PROVIDER_REGISTRY order.
 
-    Returns (client, model) for the first provider whose env var is set,
-    or (None, None) if none are configured.
+    Returns (client, model) for the first provider with usable runtime
+    credentials, or (None, None) if none are configured.
     """
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
     except ImportError:
         logger.debug("Could not import PROVIDER_REGISTRY for API-key fallback")
         return None, None
@@ -487,34 +510,24 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
-        # Check if any of the provider's env vars are set
-        api_key = ""
-        for env_var in pconfig.api_key_env_vars:
-            val = os.getenv(env_var, "").strip()
-            if val:
-                api_key = val
-                break
-        if not api_key:
-            continue
         if provider_id == "anthropic":
             return _try_anthropic()
 
-        # Resolve base URL (with optional env-var override)
-        # Kimi Code keys (sk-kimi-) need api.kimi.com/coding/v1
-        env_url = ""
-        if pconfig.base_url_env_var:
-            env_url = os.getenv(pconfig.base_url_env_var, "").strip()
-        if env_url:
-            base_url = env_url.rstrip("/")
-        elif provider_id == "kimi-coding" and api_key.startswith("sk-kimi-"):
-            base_url = "https://api.kimi.com/coding/v1"
-        else:
-            base_url = pconfig.inference_base_url
+        creds = resolve_api_key_provider_credentials(provider_id)
+        api_key = str(creds.get("api_key", "")).strip()
+        if not api_key:
+            continue
+
+        base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         model = _API_KEY_PROVIDER_AUX_MODELS.get(provider_id, "default")
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
         extra = {}
         if "api.kimi.com" in base_url.lower():
             extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+        elif "api.githubcopilot.com" in base_url.lower():
+            from hermes_cli.models import copilot_default_headers
+
+            extra["default_headers"] = copilot_default_headers()
         return OpenAI(api_key=api_key, base_url=base_url, **extra), model
 
     return None, None
@@ -659,10 +672,35 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     if not token:
         return None, None
 
+    # Allow base URL override from config.yaml model.base_url, but only
+    # when the configured provider is anthropic — otherwise a non-Anthropic
+    # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
+    base_url = _ANTHROPIC_DEFAULT_BASE_URL
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, dict):
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            if cfg_provider == "anthropic":
+                cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+                if cfg_base_url:
+                    base_url = cfg_base_url
+    except Exception:
+        pass
+
+    from agent.anthropic_adapter import _is_oauth_token
+    is_oauth = _is_oauth_token(token)
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
-    logger.debug("Auxiliary client: Anthropic native (%s)", model)
-    real_client = build_anthropic_client(token, _ANTHROPIC_DEFAULT_BASE_URL)
-    return AnthropicAuxiliaryClient(real_client, model, token, _ANTHROPIC_DEFAULT_BASE_URL), model
+    logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
+    try:
+        real_client = build_anthropic_client(token, base_url)
+    except ImportError:
+        # The anthropic_adapter module imports fine but the SDK itself is
+        # missing — build_anthropic_client raises ImportError at call time
+        # when _anthropic_sdk is None.  Treat as unavailable.
+        return None, None
+    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
 
 
 def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -701,6 +739,8 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
 
 def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain: OpenRouter → Nous → custom → Codex → API-key → None."""
+    global auxiliary_is_nous
+    auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     for try_fn in (_try_openrouter, _try_nous, _try_custom_endpoint,
                    _try_codex, _resolve_api_key_provider):
         client, model = try_fn()
@@ -737,6 +777,10 @@ def _to_async_client(sync_client, model: str):
     base_lower = str(sync_client.base_url).lower()
     if "openrouter" in base_lower:
         async_kwargs["default_headers"] = dict(_OR_HEADERS)
+    elif "api.githubcopilot.com" in base_lower:
+        from hermes_cli.models import copilot_default_headers
+
+        async_kwargs["default_headers"] = copilot_default_headers()
     elif "api.kimi.com" in base_lower:
         async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
     return AsyncOpenAI(**async_kwargs), model
@@ -878,7 +922,7 @@ def resolve_provider_client(
 
     # ── API-key providers from PROVIDER_REGISTRY ─────────────────────
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_kimi_base_url
+        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
     except ImportError:
         logger.debug("hermes_cli.auth not available for provider %s", provider)
         return None, None
@@ -897,26 +941,18 @@ def resolve_provider_client(
             final_model = model or default_model
             return (_to_async_client(client, final_model) if async_mode else (client, final_model))
 
-        # Find the first configured API key
-        api_key = ""
-        for env_var in pconfig.api_key_env_vars:
-            api_key = os.getenv(env_var, "").strip()
-            if api_key:
-                break
+        creds = resolve_api_key_provider_credentials(provider)
+        api_key = str(creds.get("api_key", "")).strip()
         if not api_key:
+            tried_sources = list(pconfig.api_key_env_vars)
+            if provider == "copilot":
+                tried_sources.append("gh auth token")
             logger.warning("resolve_provider_client: provider %s has no API "
                            "key configured (tried: %s)",
-                           provider, ", ".join(pconfig.api_key_env_vars))
+                           provider, ", ".join(tried_sources))
             return None, None
 
-        # Resolve base URL (env override → provider-specific logic → default)
-        base_url_override = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-        if provider == "kimi-coding":
-            base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, base_url_override)
-        elif base_url_override:
-            base_url = base_url_override
-        else:
-            base_url = pconfig.inference_base_url
+        base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
 
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = model or default_model
@@ -925,6 +961,10 @@ def resolve_provider_client(
         headers = {}
         if "api.kimi.com" in base_url.lower():
             headers["User-Agent"] = "KimiCLI/1.0"
+        elif "api.githubcopilot.com" in base_url.lower():
+            from hermes_cli.models import copilot_default_headers
+
+            headers.update(copilot_default_headers())
 
         client = OpenAI(api_key=api_key, base_url=base_url,
                         **({"default_headers": headers} if headers else {}))
@@ -1097,7 +1137,13 @@ def resolve_vision_provider_client(
         return "custom", client, final_model
 
     if requested == "auto":
-        for candidate in get_available_vision_backends():
+        ordered = list(_VISION_AUTO_PROVIDER_ORDER)
+        preferred = _preferred_main_vision_provider()
+        if preferred in ordered:
+            ordered.remove(preferred)
+            ordered.insert(0, preferred)
+
+        for candidate in ordered:
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
                 return _finalize(candidate, sync_client, default_model)
@@ -1167,6 +1213,106 @@ def auxiliary_max_tokens_param(value: int) -> dict:
 
 # Client cache: (provider, async_mode, base_url, api_key) -> (client, default_model)
 _client_cache: Dict[tuple, tuple] = {}
+_client_cache_lock = threading.Lock()
+
+
+def neuter_async_httpx_del() -> None:
+    """Monkey-patch ``AsyncHttpxClientWrapper.__del__`` to be a no-op.
+
+    The OpenAI SDK's ``AsyncHttpxClientWrapper.__del__`` schedules
+    ``self.aclose()`` via ``asyncio.get_running_loop().create_task()``.
+    When an ``AsyncOpenAI`` client is garbage-collected while
+    prompt_toolkit's event loop is running (the common CLI idle state),
+    the ``aclose()`` task runs on prompt_toolkit's loop but the
+    underlying TCP transport is bound to a *different* loop (the worker
+    thread's loop that the client was originally created on).  If that
+    loop is closed or its thread is dead, the transport's
+    ``self._loop.call_soon()`` raises ``RuntimeError("Event loop is
+    closed")``, which prompt_toolkit surfaces as "Unhandled exception
+    in event loop ... Press ENTER to continue...".
+
+    Neutering ``__del__`` is safe because:
+    - Cached clients are explicitly cleaned via ``_force_close_async_httpx``
+      on stale-loop detection and ``shutdown_cached_clients`` on exit.
+    - Uncached clients' TCP connections are cleaned up by the OS when the
+      process exits.
+    - The OpenAI SDK itself marks this as a TODO (``# TODO(someday):
+      support non asyncio runtimes here``).
+
+    Call this once at CLI startup, before any ``AsyncOpenAI`` clients are
+    created.
+    """
+    try:
+        from openai._base_client import AsyncHttpxClientWrapper
+        AsyncHttpxClientWrapper.__del__ = lambda self: None  # type: ignore[assignment]
+    except (ImportError, AttributeError):
+        pass  # Graceful degradation if the SDK changes its internals
+
+
+def _force_close_async_httpx(client: Any) -> None:
+    """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed.
+
+    This prevents ``AsyncHttpxClientWrapper.__del__`` from scheduling
+    ``aclose()`` on a (potentially closed) event loop, which causes
+    ``RuntimeError: Event loop is closed`` → prompt_toolkit's
+    "Press ENTER to continue..." handler.
+
+    We intentionally do NOT run the full async close path — the
+    connections will be dropped by the OS when the process exits.
+    """
+    try:
+        from httpx._client import ClientState
+        inner = getattr(client, "_client", None)
+        if inner is not None and not getattr(inner, "is_closed", True):
+            inner._state = ClientState.CLOSED
+    except Exception:
+        pass
+
+
+def shutdown_cached_clients() -> None:
+    """Close all cached clients (sync and async) to prevent event-loop errors.
+
+    Call this during CLI shutdown, *before* the event loop is closed, to
+    avoid ``AsyncHttpxClientWrapper.__del__`` raising on a dead loop.
+    """
+    import inspect
+
+    with _client_cache_lock:
+        for key, entry in list(_client_cache.items()):
+            client = entry[0]
+            if client is None:
+                continue
+            # Mark any async httpx transport as closed first (prevents __del__
+            # from scheduling aclose() on a dead event loop).
+            _force_close_async_httpx(client)
+            # Sync clients: close the httpx connection pool cleanly.
+            # Async clients: skip — we already neutered __del__ above.
+            try:
+                close_fn = getattr(client, "close", None)
+                if close_fn and not inspect.iscoroutinefunction(close_fn):
+                    close_fn()
+            except Exception:
+                pass
+        _client_cache.clear()
+
+
+def cleanup_stale_async_clients() -> None:
+    """Force-close cached async clients whose event loop is closed.
+
+    Call this after each agent turn to proactively clean up stale clients
+    before GC can trigger ``AsyncHttpxClientWrapper.__del__`` on them.
+    This is defense-in-depth — the primary fix is ``neuter_async_httpx_del``
+    which disables ``__del__`` entirely.
+    """
+    with _client_cache_lock:
+        stale_keys = []
+        for key, entry in _client_cache.items():
+            client, _default, cached_loop = entry
+            if cached_loop is not None and cached_loop.is_closed():
+                _force_close_async_httpx(client)
+                stale_keys.append(key)
+        for key in stale_keys:
+            del _client_cache[key]
 
 
 def _get_cached_client(
@@ -1176,11 +1322,44 @@ def _get_cached_client(
     base_url: str = None,
     api_key: str = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Get or create a cached client for the given provider."""
-    cache_key = (provider, async_mode, base_url or "", api_key or "")
-    if cache_key in _client_cache:
-        cached_client, cached_default = _client_cache[cache_key]
-        return cached_client, model or cached_default
+    """Get or create a cached client for the given provider.
+
+    Async clients (AsyncOpenAI) use httpx.AsyncClient internally, which
+    binds to the event loop that was current when the client was created.
+    Using such a client on a *different* loop causes deadlocks or
+    RuntimeError.  To prevent cross-loop issues (especially in gateway
+    mode where _run_async() may spawn fresh loops in worker threads), the
+    cache key for async clients includes the current event loop's identity
+    so each loop gets its own client instance.
+    """
+    # Include loop identity for async clients to prevent cross-loop reuse.
+    # httpx.AsyncClient (inside AsyncOpenAI) is bound to the loop where it
+    # was created — reusing it on a different loop causes deadlocks (#2681).
+    loop_id = 0
+    current_loop = None
+    if async_mode:
+        try:
+            import asyncio as _aio
+            current_loop = _aio.get_event_loop()
+            loop_id = id(current_loop)
+        except RuntimeError:
+            pass
+    cache_key = (provider, async_mode, base_url or "", api_key or "", loop_id)
+    with _client_cache_lock:
+        if cache_key in _client_cache:
+            cached_client, cached_default, cached_loop = _client_cache[cache_key]
+            if async_mode:
+                # A cached async client whose loop has been closed will raise
+                # "Event loop is closed" when httpx tries to clean up its
+                # transport.  Discard the stale client and create a fresh one.
+                if cached_loop is not None and cached_loop.is_closed():
+                    _force_close_async_httpx(cached_client)
+                    del _client_cache[cache_key]
+                else:
+                    return cached_client, model or cached_default
+            else:
+                return cached_client, model or cached_default
+    # Build outside the lock
     client, default_model = resolve_provider_client(
         provider,
         model,
@@ -1189,7 +1368,14 @@ def _get_cached_client(
         explicit_api_key=api_key,
     )
     if client is not None:
-        _client_cache[cache_key] = (client, default_model)
+        # For async clients, remember which loop they were created on so we
+        # can detect stale entries later.
+        bound_loop = current_loop
+        with _client_cache_lock:
+            if cache_key not in _client_cache:
+                _client_cache[cache_key] = (client, default_model, bound_loop)
+            else:
+                client, default_model, _ = _client_cache[cache_key]
     return client, model or default_model
 
 
@@ -1234,12 +1420,16 @@ def _resolve_task_provider_model(
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
 
-        # Backwards compat: compression section has its own keys
-        if task == "compression" and not cfg_provider:
+        # Backwards compat: compression section has its own keys.
+        # The auxiliary.compression defaults to provider="auto", so treat
+        # both None and "auto" as "not explicitly configured".
+        if task == "compression" and (not cfg_provider or cfg_provider == "auto"):
             comp = config.get("compression", {}) if isinstance(config, dict) else {}
             if isinstance(comp, dict):
                 cfg_provider = comp.get("summary_provider", "").strip() or None
                 cfg_model = cfg_model or comp.get("summary_model", "").strip() or None
+                _sbu = comp.get("summary_base_url") or ""
+                cfg_base_url = cfg_base_url or _sbu.strip() or None
 
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
     resolved_model = model or env_model or cfg_model
@@ -1387,8 +1577,18 @@ def call_llm(
             api_key=resolved_api_key,
         )
         if client is None:
-            # Fallback: try openrouter
-            if resolved_provider != "openrouter" and not resolved_base_url:
+            # When the user explicitly chose a non-OpenRouter provider but no
+            # credentials were found, fail fast instead of silently routing
+            # through OpenRouter (which causes confusing 404s).
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+                raise RuntimeError(
+                    f"Provider '{_explicit}' is set in config.yaml but no API key "
+                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"variable, or switch to a different provider with `hermes model`."
+                )
+            # For auto/custom, fall back to OpenRouter
+            if not resolved_base_url:
                 logger.warning("Provider %s unavailable, falling back to openrouter",
                                resolved_provider)
                 client, final_model = _get_cached_client(
@@ -1414,6 +1614,62 @@ def call_llm(
             kwargs["max_completion_tokens"] = max_tokens
             return client.chat.completions.create(**kwargs)
         raise
+
+
+def extract_content_or_reasoning(response) -> str:
+    """Extract content from an LLM response, falling back to reasoning fields.
+
+    Mirrors the main agent loop's behavior when a reasoning model (DeepSeek-R1,
+    Qwen-QwQ, etc.) returns ``content=None`` with reasoning in structured fields.
+
+    Resolution order:
+      1. ``message.content`` — strip inline think/reasoning blocks, check for
+         remaining non-whitespace text.
+      2. ``message.reasoning`` / ``message.reasoning_content`` — direct
+         structured reasoning fields (DeepSeek, Moonshot, Novita, etc.).
+      3. ``message.reasoning_details`` — OpenRouter unified array format.
+
+    Returns the best available text, or ``""`` if nothing found.
+    """
+    import re
+
+    msg = response.choices[0].message
+    content = (msg.content or "").strip()
+
+    if content:
+        # Strip inline think/reasoning blocks (mirrors _strip_think_blocks)
+        cleaned = re.sub(
+            r"<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>"
+            r".*?"
+            r"</(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>",
+            "", content, flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        if cleaned:
+            return cleaned
+
+    # Content is empty or reasoning-only — try structured reasoning fields
+    reasoning_parts: list[str] = []
+    for field in ("reasoning", "reasoning_content"):
+        val = getattr(msg, field, None)
+        if val and isinstance(val, str) and val.strip() and val not in reasoning_parts:
+            reasoning_parts.append(val.strip())
+
+    details = getattr(msg, "reasoning_details", None)
+    if details and isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict):
+                summary = (
+                    detail.get("summary")
+                    or detail.get("content")
+                    or detail.get("text")
+                )
+                if summary and summary not in reasoning_parts:
+                    reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+
+    if reasoning_parts:
+        return "\n\n".join(reasoning_parts)
+
+    return ""
 
 
 async def async_call_llm(
@@ -1470,7 +1726,14 @@ async def async_call_llm(
             api_key=resolved_api_key,
         )
         if client is None:
-            if resolved_provider != "openrouter" and not resolved_base_url:
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+                raise RuntimeError(
+                    f"Provider '{_explicit}' is set in config.yaml but no API key "
+                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"variable, or switch to a different provider with `hermes model`."
+                )
+            if not resolved_base_url:
                 logger.warning("Provider %s unavailable, falling back to openrouter",
                                resolved_provider)
                 client, final_model = _get_cached_client(

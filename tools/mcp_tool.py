@@ -605,7 +605,9 @@ class SamplingHandler:
                     "function": {
                         "name": getattr(t, "name", ""),
                         "description": getattr(t, "description", "") or "",
-                        "parameters": getattr(t, "inputSchema", {}) or {},
+                        "parameters": _normalize_mcp_input_schema(
+                            getattr(t, "inputSchema", None)
+                        ),
                     },
                 }
                 for t in server_tools
@@ -688,7 +690,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_tools", "_error", "_config",
-        "_sampling", "_registered_tool_names",
+        "_sampling", "_registered_tool_names", "_auth_type",
     )
 
     def __init__(self, name: str):
@@ -703,6 +705,7 @@ class MCPServerTask:
         self._config: dict = {}
         self._sampling: Optional[SamplingHandler] = None
         self._registered_tool_names: list[str] = []
+        self._auth_type: str = ""
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -746,15 +749,28 @@ class MCPServerTask:
             )
 
         url = config["url"]
-        headers = config.get("headers")
+        headers = dict(config.get("headers") or {})
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
+        # OAuth 2.1 PKCE: build httpx.Auth handler using the MCP SDK
+        _oauth_auth = None
+        if self._auth_type == "oauth":
+            try:
+                from tools.mcp_oauth import build_oauth_auth
+                _oauth_auth = build_oauth_auth(self.name, url)
+            except Exception as exc:
+                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
-        async with streamablehttp_client(
-            url,
-            headers=headers,
-            timeout=float(connect_timeout),
-        ) as (read_stream, write_stream, _get_session_id):
+        _http_kwargs: dict = {
+            "headers": headers,
+            "timeout": float(connect_timeout),
+        }
+        if _oauth_auth is not None:
+            _http_kwargs["auth"] = _oauth_auth
+        async with streamablehttp_client(url, **_http_kwargs) as (
+            read_stream, write_stream, _get_session_id,
+        ):
             async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                 await session.initialize()
                 self.session = session
@@ -781,6 +797,7 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
+        self._auth_type = (config.get("auth") or "").lower().strip()
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
@@ -918,13 +935,30 @@ def _run_on_mcp_loop(coro, timeout: float = 30):
 # Config loading
 # ---------------------------------------------------------------------------
 
+def _interpolate_env_vars(value):
+    """Recursively resolve ``${VAR}`` placeholders from ``os.environ``."""
+    if isinstance(value, str):
+        import re
+        def _replace(m):
+            return os.environ.get(m.group(1), m.group(0))
+        return re.sub(r"\$\{([^}]+)\}", _replace, value)
+    if isinstance(value, dict):
+        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_env_vars(v) for v in value]
+    return value
+
+
 def _load_mcp_config() -> Dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
     Returns a dict of ``{server_name: server_config}`` or empty dict.
     Server config can contain either ``command``/``args``/``env`` for stdio
     transport or ``url``/``headers`` for HTTP transport, plus optional
-    ``timeout`` and ``connect_timeout`` overrides.
+    ``timeout``, ``connect_timeout``, and ``auth`` overrides.
+
+    ``${ENV_VAR}`` placeholders in string values are resolved from
+    ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
         from hermes_cli.config import load_config
@@ -932,7 +966,13 @@ def _load_mcp_config() -> Dict[str, dict]:
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
             return {}
-        return servers
+        # Ensure .env vars are available for interpolation
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv()
+        except Exception:
+            pass
+        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -1213,6 +1253,17 @@ def _make_check_fn(server_name: str):
 # Discovery & registration
 # ---------------------------------------------------------------------------
 
+def _normalize_mcp_input_schema(schema: dict | None) -> dict:
+    """Normalize MCP input schemas for LLM tool-calling compatibility."""
+    if not schema:
+        return {"type": "object", "properties": {}}
+
+    if schema.get("type") == "object" and "properties" not in schema:
+        return {**schema, "properties": {}}
+
+    return schema
+
+
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     """Convert an MCP tool listing to the Hermes registry schema format.
 
@@ -1231,11 +1282,59 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
-        "parameters": mcp_tool.inputSchema if mcp_tool.inputSchema else {
-            "type": "object",
-            "properties": {},
-        },
+        "parameters": _normalize_mcp_input_schema(mcp_tool.inputSchema),
     }
+
+
+def _sync_mcp_toolsets(server_names: Optional[List[str]] = None) -> None:
+    """Expose each MCP server as a standalone toolset and inject into hermes-* sets.
+
+    Creates a real toolset entry in TOOLSETS for each server name (e.g.
+    TOOLSETS["github"] = {"tools": ["mcp_github_list_files", ...]}). This
+    makes raw server names resolvable in platform_toolsets overrides.
+
+    Also injects all MCP tools into hermes-* umbrella toolsets for the
+    default behavior.
+
+    Skips server names that collide with built-in toolsets.
+    """
+    from toolsets import TOOLSETS
+
+    if server_names is None:
+        server_names = list(_load_mcp_config().keys())
+
+    existing = _existing_tool_names()
+    all_mcp_tools: List[str] = []
+
+    for server_name in server_names:
+        safe_prefix = f"mcp_{server_name.replace('-', '_').replace('.', '_')}_"
+        server_tools = sorted(
+            t for t in existing if t.startswith(safe_prefix)
+        )
+        all_mcp_tools.extend(server_tools)
+
+        # Don't overwrite a built-in toolset that happens to share the name.
+        existing_ts = TOOLSETS.get(server_name)
+        if existing_ts and not str(existing_ts.get("description", "")).startswith("MCP server '"):
+            logger.warning(
+                "Skipping MCP toolset alias '%s' — a built-in toolset already uses that name",
+                server_name,
+            )
+            continue
+
+        TOOLSETS[server_name] = {
+            "description": f"MCP server '{server_name}' tools",
+            "tools": server_tools,
+            "includes": [],
+        }
+
+    # Also inject into hermes-* umbrella toolsets for default behavior.
+    for ts_name, ts in TOOLSETS.items():
+        if not ts_name.startswith("hermes-"):
+            continue
+        for tool_name in all_mcp_tools:
+            if tool_name not in ts["tools"]:
+                ts["tools"].append(tool_name)
 
 
 def _build_utility_schemas(server_name: str) -> List[dict]:
@@ -1433,6 +1532,16 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
 
+        # Guard against collisions with built-in (non-MCP) tools.
+        existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': tool '%s' (→ '%s') collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, mcp_tool.name, tool_name_prefixed, existing_toolset,
+            )
+            continue
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
@@ -1457,9 +1566,20 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = entry["schema"]
         handler_key = entry["handler_key"]
         handler = _handler_factories[handler_key](name, server.tool_timeout)
+        util_name = schema["name"]
+
+        # Same collision guard for utility tools.
+        existing_toolset = registry.get_toolset_for_tool(util_name)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': utility tool '%s' collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, util_name, existing_toolset,
+            )
+            continue
 
         registry.register(
-            name=schema["name"],
+            name=util_name,
             toolset=toolset_name,
             schema=schema,
             handler=handler,
@@ -1467,7 +1587,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             is_async=False,
             description=schema["description"],
         )
-        registered_names.append(schema["name"])
+        registered_names.append(util_name)
 
     server._registered_tool_names = list(registered_names)
 
@@ -1523,6 +1643,7 @@ def discover_mcp_tools() -> List[str]:
         }
 
     if not new_servers:
+        _sync_mcp_toolsets(list(servers.keys()))
         return _existing_tool_names()
 
     # Start the background event loop for MCP connections
@@ -1562,14 +1683,7 @@ def discover_mcp_tools() -> List[str]:
     # The outer timeout is generous: 120s total for parallel discovery.
     _run_on_mcp_loop(_discover_all(), timeout=120)
 
-    if all_tools:
-        # Dynamically inject into all hermes-* platform toolsets
-        from toolsets import TOOLSETS
-        for ts_name, ts in TOOLSETS.items():
-            if ts_name.startswith("hermes-"):
-                for tool_name in all_tools:
-                    if tool_name not in ts["tools"]:
-                        ts["tools"].append(tool_name)
+    _sync_mcp_toolsets(list(servers.keys()))
 
     # Print summary
     total_servers = len(new_servers)
@@ -1620,6 +1734,72 @@ def get_mcp_status() -> List[dict]:
                 "tools": 0,
                 "connected": False,
             })
+
+    return result
+
+
+def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
+    """Temporarily connect to configured MCP servers and list their tools.
+
+    Designed for ``hermes tools`` interactive configuration — connects to each
+    enabled server, grabs tool names and descriptions, then disconnects.
+    Does NOT register tools in the Hermes registry.
+
+    Returns:
+        Dict mapping server name to list of (tool_name, description) tuples.
+        Servers that fail to connect are omitted from the result.
+    """
+    if not _MCP_AVAILABLE:
+        return {}
+
+    servers_config = _load_mcp_config()
+    if not servers_config:
+        return {}
+
+    enabled = {
+        k: v for k, v in servers_config.items()
+        if _parse_boolish(v.get("enabled", True), default=True)
+    }
+    if not enabled:
+        return {}
+
+    _ensure_mcp_loop()
+
+    result: Dict[str, List[tuple]] = {}
+    probed_servers: List[MCPServerTask] = []
+
+    async def _probe_all():
+        names = list(enabled.keys())
+        coros = []
+        for name, cfg in enabled.items():
+            ct = cfg.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+            coros.append(asyncio.wait_for(_connect_server(name, cfg), timeout=ct))
+
+        outcomes = await asyncio.gather(*coros, return_exceptions=True)
+
+        for name, outcome in zip(names, outcomes):
+            if isinstance(outcome, Exception):
+                logger.debug("Probe: failed to connect to '%s': %s", name, outcome)
+                continue
+            probed_servers.append(outcome)
+            tools = []
+            for t in outcome._tools:
+                desc = getattr(t, "description", "") or ""
+                tools.append((t.name, desc))
+            result[name] = tools
+
+        # Shut down all probed connections
+        await asyncio.gather(
+            *(s.shutdown() for s in probed_servers),
+            return_exceptions=True,
+        )
+
+    try:
+        _run_on_mcp_loop(_probe_all(), timeout=120)
+    except Exception as exc:
+        logger.debug("MCP probe failed: %s", exc)
+    finally:
+        _stop_mcp_loop()
 
     return result
 

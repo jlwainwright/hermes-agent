@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -18,7 +19,8 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Any
+from pathlib import Path
+from typing import Callable, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+import re
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -48,6 +52,8 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_audio_from_url,
+    cache_document_from_bytes,
+    SUPPORTED_DOCUMENT_TYPES,
 )
 
 
@@ -434,8 +440,15 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Track threads where the bot has participated so follow-up messages
-        # in those threads don't require @mention.
-        self._bot_participated_threads: set = set()
+        # in those threads don't require @mention.  Persisted to disk so the
+        # set survives gateway restarts.
+        self._bot_participated_threads: set = self._load_participated_threads()
+        # Persistent typing indicator loops per channel (DMs don't reliably
+        # show the standard typing gateway event for bots)
+        self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._bot_task: Optional[asyncio.Task] = None
+        # Cap to prevent unbounded growth (Discord threads get archived).
+        self._MAX_TRACKED_THREADS = 500
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -519,6 +532,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.author == self._client.user:
                     return
                 
+                # Ignore Discord system messages (thread renames, pins, member joins, etc.)
+                # Allow both default and reply types — replies have a distinct MessageType.
+                if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                    return
+                
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
@@ -571,7 +589,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._register_slash_commands()
             
             # Start the bot in background
-            asyncio.create_task(self._client.start(self.config.token))
+            self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             
             # Wait for ready
             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
@@ -1234,14 +1252,48 @@ class DiscordAdapter(BasePlatformAdapter):
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
     
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Send typing indicator."""
-        if self._client:
+        """Start a persistent typing indicator for a channel.
+
+        Discord's TYPING_START gateway event is unreliable in DMs for bots.
+        Instead, start a background loop that hits the typing endpoint every
+        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
+        stop_typing() is called (after the response is sent).
+        """
+        if not self._client:
+            return
+        # Don't start a duplicate loop
+        if chat_id in self._typing_tasks:
+            return
+
+        async def _typing_loop() -> None:
             try:
-                channel = self._client.get_channel(int(chat_id))
-                if channel:
-                    await channel.typing()
-            except Exception:
-                pass  # Ignore typing indicator failures
+                while True:
+                    try:
+                        route = discord.http.Route(
+                            "POST", "/channels/{channel_id}/typing",
+                            channel_id=chat_id,
+                        )
+                        await self._client.http.request(route)
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
+                        return
+                    await asyncio.sleep(8)
+            except asyncio.CancelledError:
+                pass
+
+        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Stop the persistent typing indicator for a channel."""
+        task = self._typing_tasks.pop(chat_id, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
@@ -1359,16 +1411,17 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         interaction: discord.Interaction,
         command_text: str,
-        followup_msg: str = "Done~",
+        followup_msg: str | None = None,
     ) -> None:
         """Common handler for simple slash commands that dispatch a command string."""
         await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
-        try:
-            await interaction.followup.send(followup_msg, ephemeral=True)
-        except Exception as e:
-            logger.debug("Discord followup failed: %s", e)
+        if followup_msg:
+            try:
+                await interaction.followup.send(followup_msg, ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -1376,19 +1429,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         tree = self._client.tree
-
-        @tree.command(name="ask", description="Ask Hermes a question")
-        @discord.app_commands.describe(question="Your question for Hermes")
-        async def slash_ask(interaction: discord.Interaction, question: str):
-            await interaction.response.defer()
-            event = self._build_slash_event(interaction, question)
-            await self.handle_message(event)
-            # The response is sent via the normal send() flow
-            # Send a followup to close the interaction if needed
-            try:
-                await interaction.followup.send("Processing complete~", ephemeral=True)
-            except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
 
         @tree.command(name="new", description="Start a new conversation")
         async def slash_new(interaction: discord.Interaction):
@@ -1409,10 +1449,6 @@ class DiscordAdapter(BasePlatformAdapter):
             await interaction.response.defer(ephemeral=True)
             event = self._build_slash_event(interaction, f"/reasoning {effort}".strip())
             await self.handle_message(event)
-            try:
-                await interaction.followup.send("Done~", ephemeral=True)
-            except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
 
         @tree.command(name="personality", description="Set a personality")
         @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
@@ -1488,10 +1524,6 @@ class DiscordAdapter(BasePlatformAdapter):
             await interaction.response.defer(ephemeral=True)
             event = self._build_slash_event(interaction, f"/voice {mode}".strip())
             await self.handle_message(event)
-            try:
-                await interaction.followup.send("Done~", ephemeral=True)
-            except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
@@ -1515,7 +1547,17 @@ class DiscordAdapter(BasePlatformAdapter):
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
         is_dm = isinstance(interaction.channel, discord.DMChannel)
-        chat_type = "dm" if is_dm else "group"
+        is_thread = isinstance(interaction.channel, discord.Thread)
+        thread_id = None
+
+        if is_dm:
+            chat_type = "dm"
+        elif is_thread:
+            chat_type = "thread"
+            thread_id = str(interaction.channel_id)
+        else:
+            chat_type = "group"
+
         chat_name = ""
         if not is_dm and hasattr(interaction.channel, "name"):
             chat_name = interaction.channel.name
@@ -1531,6 +1573,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=str(interaction.user.id),
             user_name=interaction.user.display_name,
+            thread_id=thread_id,
             chat_topic=chat_topic,
         )
 
@@ -1572,6 +1615,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Tell the user where the thread is
         link = f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
         await interaction.followup.send(f"Created thread {link}", ephemeral=True)
+
+        # Track thread participation so follow-ups don't require @mention
+        if thread_id:
+            self._track_thread(thread_id)
 
         # If a message was provided, kick off a new Hermes session in the thread
         starter = (message or "").strip()
@@ -1740,9 +1787,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
 
+            # Discord embed description limit is 4096; show full command up to that
+            max_desc = 4088
+            cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
             embed = discord.Embed(
                 title="Command Approval Required",
-                description=f"```\n{command[:500]}\n```",
+                description=f"```\n{cmd_display}\n```",
                 color=discord.Color.orange(),
             )
             embed.set_footer(text=f"Approval ID: {approval_id}")
@@ -1798,6 +1848,49 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"{parent_name} / {thread_name}"
         return thread_name
 
+    # ------------------------------------------------------------------
+    # Thread participation persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _thread_state_path() -> Path:
+        """Path to the persisted thread participation set."""
+        from hermes_cli.config import get_hermes_home
+        return get_hermes_home() / "discord_threads.json"
+
+    @classmethod
+    def _load_participated_threads(cls) -> set:
+        """Load persisted thread IDs from disk."""
+        path = cls._thread_state_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            logger.debug("Could not load discord thread state: %s", e)
+        return set()
+
+    def _save_participated_threads(self) -> None:
+        """Persist the current thread set to disk (best-effort)."""
+        path = self._thread_state_path()
+        try:
+            # Trim to most recent entries if over cap
+            thread_list = list(self._bot_participated_threads)
+            if len(thread_list) > self._MAX_TRACKED_THREADS:
+                thread_list = thread_list[-self._MAX_TRACKED_THREADS:]
+                self._bot_participated_threads = set(thread_list)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(thread_list), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Could not save discord thread state: %s", e)
+
+    def _track_thread(self, thread_id: str) -> None:
+        """Add a thread to the participation set and persist."""
+        if thread_id not in self._bot_participated_threads:
+            self._bot_participated_threads.add(thread_id)
+            self._save_participated_threads()
+
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -1850,7 +1943,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     is_thread = True
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
-                    self._bot_participated_threads.add(thread_id)
+                    self._track_thread(thread_id)
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -1867,7 +1960,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     elif att.content_type.startswith("audio/"):
                         msg_type = MessageType.AUDIO
                     else:
-                        msg_type = MessageType.DOCUMENT
+                        doc_ext = ""
+                        if att.filename:
+                            _, doc_ext = os.path.splitext(att.filename)
+                            doc_ext = doc_ext.lower()
+                        if doc_ext in SUPPORTED_DOCUMENT_TYPES:
+                            msg_type = MessageType.DOCUMENT
                     break
         
         # When auto-threading kicked in, route responses to the new thread
@@ -1904,6 +2002,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # vision tool can access them reliably (Discord CDN URLs can expire).
         media_urls = []
         media_types = []
+        pending_text_injection: Optional[str] = None
         for att in message.attachments:
             content_type = att.content_type or "unknown"
             if content_type.startswith("image/"):
@@ -1935,12 +2034,75 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_urls.append(att.url)
                     media_types.append(content_type)
             else:
-                # Other attachments: keep the original URL
-                media_urls.append(att.url)
-                media_types.append(content_type)
+                # Document attachments: download, cache, and optionally inject text
+                ext = ""
+                if att.filename:
+                    _, ext = os.path.splitext(att.filename)
+                    ext = ext.lower()
+                if not ext and content_type:
+                    mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+                    ext = mime_to_ext.get(content_type, "")
+                if ext not in SUPPORTED_DOCUMENT_TYPES:
+                    logger.warning(
+                        "[Discord] Unsupported document type '%s' (%s), skipping",
+                        ext or "unknown", content_type,
+                    )
+                else:
+                    MAX_DOC_BYTES = 20 * 1024 * 1024
+                    if att.size and att.size > MAX_DOC_BYTES:
+                        logger.warning(
+                            "[Discord] Document too large (%s bytes), skipping: %s",
+                            att.size, att.filename,
+                        )
+                    else:
+                        try:
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(
+                                    att.url,
+                                    timeout=aiohttp.ClientTimeout(total=30),
+                                ) as resp:
+                                    if resp.status != 200:
+                                        raise Exception(f"HTTP {resp.status}")
+                                    raw_bytes = await resp.read()
+                            cached_path = cache_document_from_bytes(
+                                raw_bytes, att.filename or f"document{ext}"
+                            )
+                            doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                            media_urls.append(cached_path)
+                            media_types.append(doc_mime)
+                            logger.info("[Discord] Cached user document: %s", cached_path)
+                            # Inject text content for .txt/.md files (capped at 100 KB)
+                            MAX_TEXT_INJECT_BYTES = 100 * 1024
+                            if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                                try:
+                                    text_content = raw_bytes.decode("utf-8")
+                                    display_name = att.filename or f"document{ext}"
+                                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                                    injection = f"[Content of {display_name}]:\n{text_content}"
+                                    if pending_text_injection:
+                                        pending_text_injection = f"{pending_text_injection}\n\n{injection}"
+                                    else:
+                                        pending_text_injection = injection
+                                except UnicodeDecodeError:
+                                    pass
+                        except Exception as e:
+                            logger.warning(
+                                "[Discord] Failed to cache document %s: %s",
+                                att.filename, e, exc_info=True,
+                            )
         
+        event_text = message.content
+        if pending_text_injection:
+            event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
+
+        # Defense-in-depth: prevent empty user messages from entering session
+        # (can happen when user sends @mention-only with no other text)
+        if not event_text or not event_text.strip():
+            event_text = "(The user sent a message with no text content)"
+
         event = MessageEvent(
-            text=message.content,
+            text=event_text,
             message_type=msg_type,
             source=source,
             raw_message=message,
@@ -1954,7 +2116,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
-            self._bot_participated_threads.add(thread_id)
+            self._track_thread(thread_id)
 
         await self.handle_message(event)
 

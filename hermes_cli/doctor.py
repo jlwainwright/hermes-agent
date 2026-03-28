@@ -8,7 +8,6 @@ import os
 import sys
 import subprocess
 import shutil
-from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 
@@ -26,10 +25,6 @@ if _env_path.exists():
 # Also try project .env as dev fallback
 load_dotenv(PROJECT_ROOT / ".env", override=False, encoding="utf-8")
 
-# Point mini-swe-agent at ~/.hermes/ so it shares our config
-os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(HERMES_HOME))
-os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
-
 from hermes_cli.colors import Colors, color
 from hermes_constants import OPENROUTER_MODELS_URL
 
@@ -46,6 +41,7 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
+    "KILOCODE_API_KEY",
 )
 
 
@@ -451,7 +447,7 @@ def run_doctor(args):
             check_fail("DAYTONA_API_KEY not set", "(required for TERMINAL_ENV=daytona)")
             issues.append("Set DAYTONA_API_KEY environment variable")
         try:
-            from daytona import Daytona
+            from daytona import Daytona  # noqa: F401 — SDK presence check
             check_ok("daytona SDK", "(installed)")
         except ImportError:
             check_fail("daytona SDK not installed", "(pip install daytona)")
@@ -570,6 +566,8 @@ def run_doctor(args):
         # MiniMax APIs don't support /models endpoint — https://github.com/NousResearch/hermes-agent/issues/811
         ("MiniMax",          ("MINIMAX_API_KEY",),                            None,                                  "MINIMAX_BASE_URL", False),
         ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         None,                                  "MINIMAX_CN_BASE_URL", False),
+        ("AI Gateway",       ("AI_GATEWAY_API_KEY",),                          "https://ai-gateway.vercel.sh/v1/models", "AI_GATEWAY_BASE_URL", True),
+        ("Kilo Code",        ("KILOCODE_API_KEY",),                            "https://api.kilo.ai/api/gateway/models",  "KILOCODE_BASE_URL", True),
     ]
     for _pname, _env_vars, _default_url, _base_env, _supports_health_check in _apikey_providers:
         _key = ""
@@ -614,18 +612,6 @@ def run_doctor(args):
     # =========================================================================
     print()
     print(color("◆ Submodules", Colors.CYAN, Colors.BOLD))
-    
-    # mini-swe-agent (terminal tool backend)
-    mini_swe_dir = PROJECT_ROOT / "mini-swe-agent"
-    if mini_swe_dir.exists() and (mini_swe_dir / "pyproject.toml").exists():
-        try:
-            __import__("minisweagent")
-            check_ok("mini-swe-agent", "(terminal backend)")
-        except ImportError:
-            check_warn("mini-swe-agent found but not installed", "(run: uv pip install -e ./mini-swe-agent)")
-            issues.append("Install mini-swe-agent: uv pip install -e ./mini-swe-agent")
-    else:
-        check_warn("mini-swe-agent not found", "(run: git submodule update --init --recursive)")
     
     # tinker-atropos (RL training backend)
     tinker_dir = PROJECT_ROOT / "tinker-atropos"
@@ -714,13 +700,14 @@ def run_doctor(args):
     print(color("◆ Honcho Memory", Colors.CYAN, Colors.BOLD))
 
     try:
-        from honcho_integration.client import HonchoClientConfig, GLOBAL_CONFIG_PATH
+        from honcho_integration.client import HonchoClientConfig, resolve_config_path
         hcfg = HonchoClientConfig.from_global_config()
+        _honcho_cfg_path = resolve_config_path()
 
-        if not GLOBAL_CONFIG_PATH.exists():
-            check_warn("Honcho config not found", f"run: hermes honcho setup")
+        if not _honcho_cfg_path.exists():
+            check_warn("Honcho config not found", "run: hermes honcho setup")
         elif not hcfg.enabled:
-            check_info("Honcho disabled (set enabled: true in ~/.honcho/config.json to activate)")
+            check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
         elif not hcfg.api_key:
             check_fail("Honcho API key not set", "run: hermes honcho setup")
             issues.append("No Honcho API key — run 'hermes honcho setup'")

@@ -54,7 +54,7 @@ class TestScanSkillCommands:
         """macOS-only skills should not register slash commands on Linux."""
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skills_tool.sys") as mock_sys,
+            patch("agent.skill_utils.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             _make_skill(tmp_path, "imessage", frontmatter_extra="platforms: [macos]\n")
@@ -67,7 +67,7 @@ class TestScanSkillCommands:
         """macOS-only skills should register slash commands on macOS."""
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skills_tool.sys") as mock_sys,
+            patch("agent.skill_utils.sys") as mock_sys,
         ):
             mock_sys.platform = "darwin"
             _make_skill(tmp_path, "imessage", frontmatter_extra="platforms: [macos]\n")
@@ -78,12 +78,27 @@ class TestScanSkillCommands:
         """Skills without platforms field should register on any platform."""
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skills_tool.sys") as mock_sys,
+            patch("agent.skill_utils.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             _make_skill(tmp_path, "generic-tool")
             result = scan_skill_commands()
         assert "/generic-tool" in result
+
+    def test_excludes_disabled_skills(self, tmp_path):
+        """Disabled skills should not register slash commands."""
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "tools.skills_tool._get_disabled_skill_names",
+                return_value={"disabled-skill"},
+            ),
+        ):
+            _make_skill(tmp_path, "enabled-skill")
+            _make_skill(tmp_path, "disabled-skill")
+            result = scan_skill_commands()
+        assert "/enabled-skill" in result
+        assert "/disabled-skill" not in result
 
 
 class TestBuildPreloadedSkillsPrompt:

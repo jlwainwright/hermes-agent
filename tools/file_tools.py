@@ -4,13 +4,12 @@
 import errno
 import json
 import logging
-import os
 import threading
-from typing import Optional
 from tools.file_operations import ShellFileOperations
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
@@ -49,8 +48,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _check_disk_usage_warning,
-        _creation_locks, _creation_locks_lock,
+        _creation_locks,
+        _creation_locks_lock,
     )
     import time
 
@@ -169,6 +168,27 @@ def clear_file_ops_cache(task_id: str = None):
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        # Security: block direct reads of internal Hermes cache/index files
+        # to prevent prompt injection via catalog or hub metadata files.
+        import pathlib as _pathlib
+        _resolved = _pathlib.Path(path).expanduser().resolve()
+        _hermes_home = _pathlib.Path("~/.hermes").expanduser().resolve()
+        _blocked_dirs = [
+            _hermes_home / "skills" / ".hub" / "index-cache",
+            _hermes_home / "skills" / ".hub",
+        ]
+        for _blocked in _blocked_dirs:
+            try:
+                _resolved.relative_to(_blocked)
+                return json.dumps({
+                    "error": (
+                        f"Access denied: {path} is an internal Hermes cache file "
+                        "and cannot be read directly to prevent prompt injection. "
+                        "Use the skills_list or skill_view tools instead."
+                    )
+                })
+            except ValueError:
+                pass
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         if result.content:
@@ -316,7 +336,17 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         # Track searches to detect *consecutive* repeated search loops.
-        search_key = ("search", pattern, target, str(path), file_glob or "")
+        # Include pagination args so users can page through truncated
+        # results without tripping the repeated-search guard.
+        search_key = (
+            "search",
+            pattern,
+            target,
+            str(path),
+            file_glob or "",
+            limit,
+            offset,
+        )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set(),

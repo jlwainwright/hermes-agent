@@ -8,6 +8,7 @@ and implement the required methods.
 import asyncio
 import logging
 import os
+import random
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -71,31 +72,51 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     return str(filepath)
 
 
-async def cache_image_from_url(url: str, ext: str = ".jpg") -> str:
+async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
     """
     Download an image from a URL and save it to the local cache.
 
-    Uses httpx for async download with a reasonable timeout.
+    Retries on transient failures (timeouts, 429, 5xx) with exponential
+    backoff so a single slow CDN response doesn't lose the media.
 
     Args:
         url: The HTTP/HTTPS URL to download from.
         ext: File extension including the dot (e.g. ".jpg", ".png").
+        retries: Number of retry attempts on transient failures.
 
     Returns:
         Absolute path to the cached image file as a string.
     """
+    import asyncio
     import httpx
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
 
+    last_exc = None
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        response = await client.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                "Accept": "image/*,*/*;q=0.8",
-            },
-        )
-        response.raise_for_status()
-        return cache_image_from_bytes(response.content, ext)
+        for attempt in range(retries + 1):
+            try:
+                response = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                        "Accept": "image/*,*/*;q=0.8",
+                    },
+                )
+                response.raise_for_status()
+                return cache_image_from_bytes(response.content, ext)
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                    raise
+                if attempt < retries:
+                    wait = 1.5 * (attempt + 1)
+                    _log.debug("Media cache retry %d/%d for %s (%.1fs): %s",
+                               attempt + 1, retries, url[:80], wait, exc)
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+    raise last_exc
 
 
 def cleanup_image_cache(max_age_hours: int = 24) -> int:
@@ -294,6 +315,10 @@ class MessageEvent:
     
     # Reply context
     reply_to_message_id: Optional[str] = None
+    reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+    
+    # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
+    auto_skill: Optional[str] = None
     
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -325,6 +350,24 @@ class SendResult:
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
+    retryable: bool = False  # True for transient errors (network, timeout) — base will retry automatically
+
+
+# Error substrings that indicate a transient network failure worth retrying
+_RETRYABLE_ERROR_PATTERNS = (
+    "connecterror",
+    "connectionerror",
+    "connectionreset",
+    "connectionrefused",
+    "timeout",
+    "timed out",
+    "network",
+    "broken pipe",
+    "remotedisconnected",
+    "eoferror",
+    "readtimeout",
+    "writetimeout",
+)
 
 
 # Type for message handlers
@@ -503,6 +546,14 @@ class BasePlatformAdapter(ABC):
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
         pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Stop a persistent typing indicator (if the platform uses one).
+
+        Override in subclasses that start background typing loops.
+        Default is a no-op for platforms with one-shot typing indicators.
+        """
+        pass
     
     async def send_image(
         self,
@@ -510,6 +561,7 @@ class BasePlatformAdapter(ABC):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send an image natively via the platform API.
@@ -528,6 +580,7 @@ class BasePlatformAdapter(ABC):
         animation_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         Send an animated GIF natively via the platform API.
@@ -536,7 +589,7 @@ class BasePlatformAdapter(ABC):
         (e.g., Telegram send_animation) so they auto-play inline.
         Default falls back to send_image.
         """
-        return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to)
+        return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
     
     @staticmethod
     def _is_animation_url(url: str) -> bool:
@@ -710,7 +763,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -726,7 +779,75 @@ class BasePlatformAdapter(ABC):
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
-    
+
+    @staticmethod
+    def extract_local_files(content: str) -> Tuple[List[str], str]:
+        """
+        Detect bare local file paths in response text for native media delivery.
+
+        Matches absolute paths (/...) and tilde paths (~/) ending in common
+        image or video extensions.  Validates each candidate with
+        ``os.path.isfile()`` to avoid false positives from URLs or
+        non-existent paths.
+
+        Paths inside fenced code blocks (``` ... ```) and inline code
+        (`...`) are ignored so that code samples are never mutilated.
+
+        Returns:
+            Tuple of (list of expanded file paths, cleaned text with the
+            raw path strings removed).
+        """
+        _LOCAL_MEDIA_EXTS = (
+            '.png', '.jpg', '.jpeg', '.gif', '.webp',
+            '.mp4', '.mov', '.avi', '.mkv', '.webm',
+        )
+        ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
+
+        # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
+        #             and relative paths (./foo.png)
+        # (?:~/|/)    anchors to absolute or home-relative paths
+        path_re = re.compile(
+            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:' + ext_part + r')\b',
+            re.IGNORECASE,
+        )
+
+        # Build spans covered by fenced code blocks and inline code
+        code_spans: list = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            code_spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', content):
+            code_spans.append((m.start(), m.end()))
+
+        def _in_code(pos: int) -> bool:
+            return any(s <= pos < e for s, e in code_spans)
+
+        found: list = []  # (raw_match_text, expanded_path)
+        for match in path_re.finditer(content):
+            if _in_code(match.start()):
+                continue
+            raw = match.group(0)
+            expanded = os.path.expanduser(raw)
+            if os.path.isfile(expanded):
+                found.append((raw, expanded))
+
+        # Deduplicate by expanded path, preserving discovery order
+        seen: set = set()
+        unique: list = []
+        for raw, expanded in found:
+            if expanded not in seen:
+                seen.add(expanded)
+                unique.append((raw, expanded))
+
+        paths = [expanded for _, expanded in unique]
+
+        cleaned = content
+        if unique:
+            for raw, _exp in unique:
+                cleaned = cleaned.replace(raw, '')
+            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+        return paths, cleaned
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
         """
         Continuously send typing indicator until cancelled.
@@ -740,7 +861,102 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
+        finally:
+            # Ensure the underlying platform typing loop is stopped.
+            # _keep_typing may have called send_typing() after an outer
+            # stop_typing() cleared the task dict, recreating the loop.
+            # Cancelling _keep_typing alone won't clean that up.
+            if hasattr(self, "stop_typing"):
+                try:
+                    await self.stop_typing(chat_id)
+                except Exception:
+                    pass
     
+    @staticmethod
+    def _is_retryable_error(error: Optional[str]) -> bool:
+        """Return True if the error string looks like a transient network failure."""
+        if not error:
+            return False
+        lowered = error.lower()
+        return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> "SendResult":
+        """
+        Send a message with automatic retry for transient network errors.
+
+        On permanent failures (e.g. formatting / permission errors) falls back
+        to a plain-text version before giving up. If all attempts fail due to
+        network errors, sends the user a brief delivery-failure notice so they
+        know to retry rather than waiting indefinitely.
+        """
+
+        result = await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+        if result.success:
+            return result
+
+        error_str = result.error or ""
+        is_network = result.retryable or self._is_retryable_error(error_str)
+
+        if is_network:
+            # Retry with exponential backoff for transient errors
+            for attempt in range(1, max_retries + 1):
+                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                logger.warning(
+                    "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
+                    self.name, attempt, max_retries, delay, error_str,
+                )
+                await asyncio.sleep(delay)
+                result = await self.send(
+                    chat_id=chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                if result.success:
+                    logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                error_str = result.error or ""
+                if not (result.retryable or self._is_retryable_error(error_str)):
+                    break  # error switched to non-transient — fall through to plain-text fallback
+            else:
+                # All retries exhausted (loop completed without break) — notify user
+                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                notice = (
+                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
+                    "Please try again \u2014 your request was processed but the response could not be sent."
+                )
+                try:
+                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                except Exception as notify_err:
+                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                return result
+
+        # Non-network / post-retry formatting failure: try plain text as fallback
+        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        fallback_result = await self.send(
+            chat_id=chat_id,
+            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not fallback_result.success:
+            logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
+        return fallback_result
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -839,8 +1055,17 @@ class BasePlatformAdapter(ABC):
                 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
+                # Strip any remaining internal directives from message body (fixes #1561)
+                text_content = text_content.replace("[[audio_as_voice]]", "").strip()
+                text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+
+                # Auto-detect bare local file paths for native media delivery
+                # (helps small models that don't use MEDIA: syntax)
+                local_files, text_content = self.extract_local_files(text_content)
+                if local_files:
+                    logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)
@@ -881,25 +1106,12 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    result = await self.send(
+                    result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=event.message_id,
                         metadata=_thread_metadata,
                     )
-
-                    # Log send failures (don't raise - user already saw tool progress)
-                    if not result.success:
-                        print(f"[{self.name}] Failed to send response: {result.error}")
-                        # Try sending without markdown as fallback
-                        fallback_result = await self.send(
-                            chat_id=event.source.chat_id,
-                            content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
-                            reply_to=event.message_id,
-                            metadata=_thread_metadata,
-                        )
-                        if not fallback_result.success:
-                            print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
@@ -934,7 +1146,7 @@ class BasePlatformAdapter(ABC):
 
                 # Send extracted media files — route by file type
                 _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.3gp'}
+                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
                 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
                 for media_path, is_voice in media_files:
@@ -971,7 +1183,34 @@ class BasePlatformAdapter(ABC):
                             print(f"[{self.name}] Failed to send media ({ext}): {media_result.error}")
                     except Exception as media_err:
                         print(f"[{self.name}] Error sending media: {media_err}")
-            
+
+                # Send auto-detected local files as native attachments
+                for file_path in local_files:
+                    if human_delay > 0:
+                        await asyncio.sleep(human_delay)
+                    try:
+                        ext = Path(file_path).suffix.lower()
+                        if ext in _IMAGE_EXTS:
+                            await self.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=file_path,
+                                metadata=_thread_metadata,
+                            )
+                        elif ext in _VIDEO_EXTS:
+                            await self.send_video(
+                                chat_id=event.source.chat_id,
+                                video_path=file_path,
+                                metadata=_thread_metadata,
+                            )
+                        else:
+                            await self.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=file_path,
+                                metadata=_thread_metadata,
+                            )
+                    except Exception as file_err:
+                        logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
@@ -992,12 +1231,35 @@ class BasePlatformAdapter(ABC):
             print(f"[{self.name}] Error handling message: {e}")
             import traceback
             traceback.print_exc()
+            # Send the error to the user so they aren't left with radio silence
+            try:
+                error_type = type(e).__name__
+                error_detail = str(e)[:300] if str(e) else "no details available"
+                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content=(
+                        f"Sorry, I encountered an error ({error_type}).\n"
+                        f"{error_detail}\n"
+                        "Try again or use /reset to start a fresh session."
+                    ),
+                    metadata=_thread_metadata,
+                )
+            except Exception:
+                pass  # Last resort — don't let error reporting crash the handler
         finally:
             # Stop typing indicator
             typing_task.cancel()
             try:
                 await typing_task
             except asyncio.CancelledError:
+                pass
+            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
+            # that may have been recreated by _keep_typing after the last stop_typing()
+            try:
+                if hasattr(self, "stop_typing"):
+                    await self.stop_typing(event.source.chat_id)
+            except Exception:
                 pass
             # Clean up session tracking
             if session_key in self._active_sessions:
@@ -1077,7 +1339,8 @@ class BasePlatformAdapter(ABC):
         """
         return content
     
-    def truncate_message(self, content: str, max_length: int = 4096) -> List[str]:
+    @staticmethod
+    def truncate_message(content: str, max_length: int = 4096) -> List[str]:
         """
         Split a long message into chunks, preserving code block boundaries.
 
@@ -1128,6 +1391,27 @@ class BasePlatformAdapter(ABC):
                 split_at = region.rfind(" ")
             if split_at < 1:
                 split_at = headroom
+
+            # Avoid splitting inside an inline code span (`...`).
+            # If the text before split_at has an odd number of unescaped
+            # backticks, the split falls inside inline code — the resulting
+            # chunk would have an unpaired backtick and any special characters
+            # (like parentheses) inside the broken span would be unescaped,
+            # causing MarkdownV2 parse errors on Telegram.
+            candidate = remaining[:split_at]
+            backtick_count = candidate.count("`") - candidate.count("\\`")
+            if backtick_count % 2 == 1:
+                # Find the last unescaped backtick and split before it
+                last_bt = candidate.rfind("`")
+                while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                    last_bt = candidate.rfind("`", 0, last_bt)
+                if last_bt > 0:
+                    # Try to find a space or newline just before the backtick
+                    safe_split = candidate.rfind(" ", 0, last_bt)
+                    nl_split = candidate.rfind("\n", 0, last_bt)
+                    safe_split = max(safe_split, nl_split)
+                    if safe_split > headroom // 4:
+                        split_at = safe_split
 
             chunk_body = remaining[:split_at]
             remaining = remaining[split_at:].lstrip()

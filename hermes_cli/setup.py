@@ -4,9 +4,9 @@ Interactive setup wizard for Hermes Agent.
 Modular wizard with independently-runnable sections:
   1. Model & Provider — choose your AI provider and model
   2. Terminal Backend — where your agent runs commands
-  3. Messaging Platforms — connect Telegram, Discord, etc.
-  4. Tools — configure TTS, web search, image generation, etc.
-  5. Agent Settings — iterations, compression, session reset
+  3. Agent Settings — iterations, compression, session reset
+  4. Messaging Platforms — connect Telegram, Discord, etc.
+  5. Tools — configure TTS, web search, image generation, etc.
 
 Config files are stored in ~/.hermes/ for easy access.
 """
@@ -55,11 +55,90 @@ def _set_default_model(config: Dict[str, Any], model_name: str) -> None:
 # Default model lists per provider — used as fallback when the live
 # /models endpoint can't be reached.
 _DEFAULT_PROVIDER_MODELS = {
+    "copilot-acp": [
+        "copilot-acp",
+    ],
+    "copilot": [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5-mini",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gpt-4.1",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-haiku-4.5",
+        "gemini-2.5-pro",
+        "grok-code-fast-1",
+    ],
     "zai": ["glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
-    "minimax": ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
-    "minimax-cn": ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
+    "minimax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
+    "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
+    "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
+    "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
+    "huggingface": [
+        "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
+        "deepseek-ai/DeepSeek-V3.2", "moonshotai/Kimi-K2.5",
+    ],
 }
+
+
+def _current_reasoning_effort(config: Dict[str, Any]) -> str:
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict):
+        return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+    return ""
+
+
+def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
+    agent_cfg = config.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+        config["agent"] = agent_cfg
+    agent_cfg["reasoning_effort"] = effort
+
+
+def _setup_copilot_reasoning_selection(
+    config: Dict[str, Any],
+    model_id: str,
+    prompt_choice,
+    *,
+    catalog: Optional[list[dict[str, Any]]] = None,
+    api_key: str = "",
+) -> None:
+    from hermes_cli.models import github_model_reasoning_efforts, normalize_copilot_model_id
+
+    normalized_model = normalize_copilot_model_id(
+        model_id,
+        catalog=catalog,
+        api_key=api_key,
+    ) or model_id
+    efforts = github_model_reasoning_efforts(normalized_model, catalog=catalog, api_key=api_key)
+    if not efforts:
+        return
+
+    current_effort = _current_reasoning_effort(config)
+    choices = list(efforts) + ["Disable reasoning", f"Keep current ({current_effort or 'default'})"]
+
+    if current_effort == "none":
+        default_idx = len(efforts)
+    elif current_effort in efforts:
+        default_idx = efforts.index(current_effort)
+    elif "medium" in efforts:
+        default_idx = efforts.index("medium")
+    else:
+        default_idx = len(choices) - 1
+
+    effort_idx = prompt_choice("Select reasoning effort:", choices, default_idx)
+    if effort_idx < len(efforts):
+        _set_reasoning_effort(config, efforts[effort_idx])
+    elif effort_idx == len(efforts):
+        _set_reasoning_effort(config, "none")
 
 
 def _setup_provider_model_selection(config, provider_id, current_model, prompt_choice, prompt_fn):
@@ -69,29 +148,60 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
     hardcoded default list with a warning if the endpoint is unreachable.
     Always offers a 'Custom model' escape hatch.
     """
-    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
     from hermes_cli.config import get_env_value
-    from hermes_cli.models import fetch_api_models
+    from hermes_cli.models import (
+        copilot_model_api_mode,
+        fetch_api_models,
+        fetch_github_model_catalog,
+        normalize_copilot_model_id,
+    )
 
     pconfig = PROVIDER_REGISTRY[provider_id]
+    is_copilot_catalog_provider = provider_id in {"copilot", "copilot-acp"}
 
     # Resolve API key and base URL for the probe
-    api_key = ""
-    for ev in pconfig.api_key_env_vars:
-        api_key = get_env_value(ev) or os.getenv(ev, "")
-        if api_key:
-            break
-    base_url_env = pconfig.base_url_env_var or ""
-    base_url = (get_env_value(base_url_env) if base_url_env else "") or pconfig.inference_base_url
+    if is_copilot_catalog_provider:
+        api_key = ""
+        if provider_id == "copilot":
+            creds = resolve_api_key_provider_credentials(provider_id)
+            api_key = creds.get("api_key", "")
+            base_url = creds.get("base_url", "") or pconfig.inference_base_url
+        else:
+            try:
+                creds = resolve_api_key_provider_credentials("copilot")
+                api_key = creds.get("api_key", "")
+            except Exception:
+                pass
+            base_url = pconfig.inference_base_url
+        catalog = fetch_github_model_catalog(api_key)
+        current_model = normalize_copilot_model_id(
+            current_model,
+            catalog=catalog,
+            api_key=api_key,
+        ) or current_model
+    else:
+        api_key = ""
+        for ev in pconfig.api_key_env_vars:
+            api_key = get_env_value(ev) or os.getenv(ev, "")
+            if api_key:
+                break
+        base_url_env = pconfig.base_url_env_var or ""
+        base_url = (get_env_value(base_url_env) if base_url_env else "") or pconfig.inference_base_url
+        catalog = None
 
     # Try live /models endpoint
-    live_models = fetch_api_models(api_key, base_url)
+    if is_copilot_catalog_provider and catalog:
+        live_models = [item.get("id", "") for item in catalog if item.get("id")]
+    else:
+        live_models = fetch_api_models(api_key, base_url)
 
     if live_models:
         provider_models = live_models
         print_info(f"Found {len(live_models)} model(s) from {pconfig.name} API")
     else:
-        provider_models = _DEFAULT_PROVIDER_MODELS.get(provider_id, [])
+        fallback_provider_id = "copilot" if provider_id == "copilot-acp" else provider_id
+        provider_models = _DEFAULT_PROVIDER_MODELS.get(fallback_provider_id, [])
         if provider_models:
             print_warning(
                 f"Could not auto-detect models from {pconfig.name} API — showing defaults.\n"
@@ -105,12 +215,29 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
     keep_idx = len(model_choices) - 1
     model_idx = prompt_choice("Select default model:", model_choices, keep_idx)
 
+    selected_model = current_model
+
     if model_idx < len(provider_models):
-        _set_default_model(config, provider_models[model_idx])
+        selected_model = provider_models[model_idx]
+        if is_copilot_catalog_provider:
+            selected_model = normalize_copilot_model_id(
+                selected_model,
+                catalog=catalog,
+                api_key=api_key,
+            ) or selected_model
+        _set_default_model(config, selected_model)
     elif model_idx == len(provider_models):
         custom = prompt_fn("Enter model name")
         if custom:
-            _set_default_model(config, custom)
+            if is_copilot_catalog_provider:
+                selected_model = normalize_copilot_model_id(
+                    custom,
+                    catalog=catalog,
+                    api_key=api_key,
+                ) or custom
+            else:
+                selected_model = custom
+            _set_default_model(config, selected_model)
     else:
         # "Keep current" selected — validate it's compatible with the new
         # provider.  OpenRouter-formatted names (containing "/") won't work
@@ -121,7 +248,24 @@ def _setup_provider_model_selection(config, provider_id, current_model, prompt_c
                 f"and won't work with {pconfig.name}. "
                 f"Switching to {provider_models[0]}."
             )
+            selected_model = provider_models[0]
             _set_default_model(config, provider_models[0])
+
+    if provider_id == "copilot" and selected_model:
+        model_cfg = _model_config_dict(config)
+        model_cfg["api_mode"] = copilot_model_api_mode(
+            selected_model,
+            catalog=catalog,
+            api_key=api_key,
+        )
+        config["model"] = model_cfg
+        _setup_copilot_reasoning_selection(
+            config,
+            selected_model,
+            prompt_choice,
+            catalog=catalog,
+            api_key=api_key,
+        )
 
 
 def _sync_model_from_disk(config: Dict[str, Any]) -> None:
@@ -144,7 +288,6 @@ from hermes_cli.config import (
     save_env_value,
     get_env_value,
     ensure_hermes_home,
-    DEFAULT_CONFIG,
 )
 
 from hermes_cli.colors import Colors, color
@@ -410,9 +553,9 @@ def _prompt_api_key(var: dict):
 
     if value:
         save_env_value(var["name"], value)
-        print_success(f"  ✓ Saved")
+        print_success("  ✓ Saved")
     else:
-        print_warning(f"  Skipped (configure later with 'hermes setup')")
+        print_warning("  Skipped (configure later with 'hermes setup')")
 
 
 def _print_setup_summary(config: dict, hermes_home):
@@ -442,11 +585,11 @@ def _print_setup_summary(config: dict, hermes_home):
     else:
         tool_status.append(("Mixture of Agents", False, "OPENROUTER_API_KEY"))
 
-    # Firecrawl (web tools)
-    if get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"):
+    # Web tools (Parallel, Firecrawl, or Tavily)
+    if get_env_value("PARALLEL_API_KEY") or get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL") or get_env_value("TAVILY_API_KEY"):
         tool_status.append(("Web Search & Extract", True, None))
     else:
-        tool_status.append(("Web Search & Extract", False, "FIRECRAWL_API_KEY"))
+        tool_status.append(("Web Search & Extract", False, "PARALLEL_API_KEY, FIRECRAWL_API_KEY, or TAVILY_API_KEY"))
 
     # Browser tools (local Chromium or Browserbase cloud)
     import shutil
@@ -478,6 +621,16 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Text-to-Speech (ElevenLabs)", True, None))
     elif tts_provider == "openai" and get_env_value("VOICE_TOOLS_OPENAI_KEY"):
         tool_status.append(("Text-to-Speech (OpenAI)", True, None))
+    elif tts_provider == "neutts":
+        try:
+            import importlib.util
+            neutts_ok = importlib.util.find_spec("neutts") is not None
+        except Exception:
+            neutts_ok = False
+        if neutts_ok:
+            tool_status.append(("Text-to-Speech (NeuTTS local)", True, None))
+        else:
+            tool_status.append(("Text-to-Speech (NeuTTS — not installed)", False, "run 'hermes setup tts'"))
     else:
         tool_status.append(("Text-to-Speech (Edge TTS)", True, None))
 
@@ -577,9 +730,9 @@ def _print_setup_summary(config: dict, hermes_home):
         f"   {color('hermes config edit', Colors.GREEN)}    Open config in your editor"
     )
     print(f"   {color('hermes config set <key> <value>', Colors.GREEN)}")
-    print(f"                          Set a specific value")
+    print("                          Set a specific value")
     print()
-    print(f"   Or edit the files directly:")
+    print("   Or edit the files directly:")
     print(f"   {color(f'nano {get_config_path()}', Colors.DIM)}")
     print(f"   {color(f'nano {get_env_path()}', Colors.DIM)}")
     print()
@@ -607,13 +760,13 @@ def _prompt_container_resources(config: dict):
     print_info("  Persistent filesystem keeps files between sessions.")
     print_info("  Set to 'no' for ephemeral sandboxes that reset each time.")
     persist_str = prompt(
-        f"  Persist filesystem across sessions? (yes/no)", persist_label
+        "  Persist filesystem across sessions? (yes/no)", persist_label
     )
     terminal["container_persistent"] = persist_str.lower() in ("yes", "true", "y", "1")
 
     # CPU
     current_cpu = terminal.get("container_cpu", 1)
-    cpu_str = prompt(f"  CPU cores", str(current_cpu))
+    cpu_str = prompt("  CPU cores", str(current_cpu))
     try:
         terminal["container_cpu"] = float(cpu_str)
     except ValueError:
@@ -621,7 +774,7 @@ def _prompt_container_resources(config: dict):
 
     # Memory
     current_mem = terminal.get("container_memory", 5120)
-    mem_str = prompt(f"  Memory in MB (5120 = 5GB)", str(current_mem))
+    mem_str = prompt("  Memory in MB (5120 = 5GB)", str(current_mem))
     try:
         terminal["container_memory"] = int(mem_str)
     except ValueError:
@@ -629,7 +782,7 @@ def _prompt_container_resources(config: dict):
 
     # Disk
     current_disk = terminal.get("container_disk", 51200)
-    disk_str = prompt(f"  Disk in MB (51200 = 50GB)", str(current_disk))
+    disk_str = prompt("  Disk in MB (51200 = 50GB)", str(current_disk))
     try:
         terminal["container_disk"] = int(disk_str)
     except ValueError:
@@ -649,18 +802,16 @@ def setup_model_provider(config: dict):
     """Configure the inference provider and default model."""
     from hermes_cli.auth import (
         get_active_provider,
-        get_provider_auth_state,
         PROVIDER_REGISTRY,
-        format_auth_error,
-        AuthError,
         fetch_nous_models,
         resolve_nous_runtime_credentials,
         _update_config_for_provider,
         _login_openai_codex,
-        get_codex_auth_status,
         resolve_codex_runtime_credentials,
         DEFAULT_CODEX_BASE_URL,
         detect_external_credentials,
+        get_auth_status,
+        resolve_api_key_provider_credentials,
     )
 
     print_header("Inference Provider")
@@ -670,6 +821,8 @@ def setup_model_provider(config: dict):
     existing_or = get_env_value("OPENROUTER_API_KEY")
     active_oauth = get_active_provider()
     existing_custom = get_env_value("OPENAI_BASE_URL")
+    copilot_status = get_auth_status("copilot")
+    copilot_acp_status = get_auth_status("copilot-acp")
 
     model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
     current_config_provider = str(model_cfg.get("provider") or "").strip().lower() or None
@@ -690,7 +843,12 @@ def setup_model_provider(config: dict):
 
     # Detect if any provider is already configured
     has_any_provider = bool(
-        current_config_provider or active_oauth or existing_custom or existing_or
+        current_config_provider
+        or active_oauth
+        or existing_custom
+        or existing_or
+        or copilot_status.get("logged_in")
+        or copilot_acp_status.get("logged_in")
     )
 
     # Build "keep current" label
@@ -715,21 +873,29 @@ def setup_model_provider(config: dict):
         keep_label = None  # No provider configured — don't show "Keep current"
 
     provider_choices = [
+        "OpenRouter API key (100+ models, pay-per-use)",
         "Login with Nous Portal (Nous Research subscription — OAuth)",
         "Login with OpenAI Codex",
-        "OpenRouter API key (100+ models, pay-per-use)",
         "Custom OpenAI-compatible endpoint (self-hosted / VLLM / etc.)",
         "Z.AI / GLM (Zhipu AI models)",
         "Kimi / Moonshot (Kimi coding models)",
         "MiniMax (global endpoint)",
         "MiniMax China (mainland China endpoint)",
+        "Kilo Code (Kilo Gateway API)",
         "Anthropic (Claude models — API key or Claude Code subscription)",
+        "AI Gateway (Vercel — 200+ models, pay-per-use)",
+        "Alibaba Cloud / DashScope (Qwen models via Anthropic-compatible API)",
+        "OpenCode Zen (35+ curated models, pay-as-you-go)",
+        "OpenCode Go (open models, $10/month subscription)",
+        "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)",
+        "GitHub Copilot ACP (spawns `copilot --acp --stdio`)",
+        "Hugging Face Inference Providers (20+ open models)",
     ]
     if keep_label:
         provider_choices.append(keep_label)
 
     # Default to "Keep current" if a provider exists, otherwise OpenRouter (most common)
-    default_provider = len(provider_choices) - 1 if has_any_provider else 2
+    default_provider = len(provider_choices) - 1 if has_any_provider else 0
 
     if not has_any_provider:
         print_warning("An inference provider is required for Hermes to work.")
@@ -746,81 +912,7 @@ def setup_model_provider(config: dict):
     selected_base_url = None  # deferred until after model selection
     nous_models = []  # populated if Nous login succeeds
 
-    if provider_idx == 0:  # Nous Portal (OAuth)
-        selected_provider = "nous"
-        print()
-        print_header("Nous Portal Login")
-        print_info("This will open your browser to authenticate with Nous Portal.")
-        print_info("You'll need a Nous Research account with an active subscription.")
-        print()
-
-        try:
-            from hermes_cli.auth import _login_nous, ProviderConfig
-            import argparse
-
-            mock_args = argparse.Namespace(
-                portal_url=None,
-                inference_url=None,
-                client_id=None,
-                scope=None,
-                no_browser=False,
-                timeout=15.0,
-                ca_bundle=None,
-                insecure=False,
-            )
-            pconfig = PROVIDER_REGISTRY["nous"]
-            _login_nous(mock_args, pconfig)
-            _sync_model_from_disk(config)
-
-            # Fetch models for the selection step
-            try:
-                creds = resolve_nous_runtime_credentials(
-                    min_key_ttl_seconds=5 * 60,
-                    timeout_seconds=15.0,
-                )
-                nous_models = fetch_nous_models(
-                    inference_base_url=creds.get("base_url", ""),
-                    api_key=creds.get("api_key", ""),
-                )
-            except Exception as e:
-                logger.debug("Could not fetch Nous models after login: %s", e)
-
-        except SystemExit:
-            print_warning("Nous Portal login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-        except Exception as e:
-            print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-
-    elif provider_idx == 1:  # OpenAI Codex
-        selected_provider = "openai-codex"
-        print()
-        print_header("OpenAI Codex Login")
-        print()
-
-        try:
-            import argparse
-
-            mock_args = argparse.Namespace()
-            _login_openai_codex(mock_args, PROVIDER_REGISTRY["openai-codex"])
-            # Clear custom endpoint vars that would override provider routing.
-            if existing_custom:
-                save_env_value("OPENAI_BASE_URL", "")
-                save_env_value("OPENAI_API_KEY", "")
-            _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
-            _set_model_provider(config, "openai-codex", DEFAULT_CODEX_BASE_URL)
-        except SystemExit:
-            print_warning("OpenAI Codex login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-        except Exception as e:
-            print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-
-    elif provider_idx == 2:  # OpenRouter
+    if provider_idx == 0:  # OpenRouter
         selected_provider = "openrouter"
         print()
         print_header("OpenRouter API Key")
@@ -875,98 +967,96 @@ def setup_model_provider(config: dict):
         except Exception as e:
             logger.debug("Could not save provider to config.yaml: %s", e)
 
+    elif provider_idx == 1:  # Nous Portal (OAuth)
+        selected_provider = "nous"
+        print()
+        print_header("Nous Portal Login")
+        print_info("This will open your browser to authenticate with Nous Portal.")
+        print_info("You'll need a Nous Research account with an active subscription.")
+        print()
+
+        try:
+            from hermes_cli.auth import _login_nous
+            import argparse
+
+            mock_args = argparse.Namespace(
+                portal_url=None,
+                inference_url=None,
+                client_id=None,
+                scope=None,
+                no_browser=False,
+                timeout=15.0,
+                ca_bundle=None,
+                insecure=False,
+            )
+            pconfig = PROVIDER_REGISTRY["nous"]
+            _login_nous(mock_args, pconfig)
+            _sync_model_from_disk(config)
+
+            # Fetch models for the selection step
+            try:
+                creds = resolve_nous_runtime_credentials(
+                    min_key_ttl_seconds=5 * 60,
+                    timeout_seconds=15.0,
+                )
+                nous_models = fetch_nous_models(
+                    inference_base_url=creds.get("base_url", ""),
+                    api_key=creds.get("api_key", ""),
+                )
+            except Exception as e:
+                logger.debug("Could not fetch Nous models after login: %s", e)
+
+        except SystemExit:
+            print_warning("Nous Portal login was cancelled or failed.")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+        except Exception as e:
+            print_error(f"Login failed: {e}")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+
+    elif provider_idx == 2:  # OpenAI Codex
+        selected_provider = "openai-codex"
+        print()
+        print_header("OpenAI Codex Login")
+        print()
+
+        try:
+            import argparse
+
+            mock_args = argparse.Namespace()
+            _login_openai_codex(mock_args, PROVIDER_REGISTRY["openai-codex"])
+            # Clear custom endpoint vars that would override provider routing.
+            if existing_custom:
+                save_env_value("OPENAI_BASE_URL", "")
+                save_env_value("OPENAI_API_KEY", "")
+            _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
+            _set_model_provider(config, "openai-codex", DEFAULT_CODEX_BASE_URL)
+        except SystemExit:
+            print_warning("OpenAI Codex login was cancelled or failed.")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+        except Exception as e:
+            print_error(f"Login failed: {e}")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+
     elif provider_idx == 3:  # Custom endpoint
         selected_provider = "custom"
         print()
         print_header("Custom OpenAI-Compatible Endpoint")
         print_info("Works with any API that follows OpenAI's chat completions spec")
+        print()
 
-        current_url = get_env_value("OPENAI_BASE_URL") or ""
-        current_key = get_env_value("OPENAI_API_KEY")
-        _raw_model = config.get("model", "")
-        current_model = (
-            _raw_model.get("default", "")
-            if isinstance(_raw_model, dict)
-            else (_raw_model or "")
-        )
-
-        if current_url:
-            print_info(f"  Current URL: {current_url}")
-        if current_key:
-            print_info(f"  Current key: {current_key[:8]}... (configured)")
-
-        base_url = prompt(
-            "  API base URL (e.g., https://api.example.com/v1)", current_url
-        ).strip()
-        api_key = prompt("  API key", password=True)
-        model_name = prompt("  Model name (e.g., gpt-4, claude-3-opus)", current_model)
-
-        if base_url:
-            from hermes_cli.models import probe_api_models
-
-            probe = probe_api_models(api_key, base_url)
-            if probe.get("used_fallback") and probe.get("resolved_base_url"):
-                print_warning(
-                    f"Endpoint verification worked at {probe['resolved_base_url']}/models, "
-                    f"not the exact URL you entered. Saving the working base URL instead."
-                )
-                base_url = probe["resolved_base_url"]
-            elif probe.get("models") is not None:
-                print_success(
-                    f"Verified endpoint via {probe.get('probed_url')} "
-                    f"({len(probe.get('models') or [])} model(s) visible)"
-                )
-            else:
-                print_warning(
-                    f"Could not verify this endpoint via {probe.get('probed_url')}. "
-                    f"Hermes will still save it."
-                )
-                if probe.get("suggested_base_url"):
-                    print_info(
-                        f"  If this server expects /v1, try base URL: {probe['suggested_base_url']}"
-                    )
-
-            save_env_value("OPENAI_BASE_URL", base_url)
-        if api_key:
-            save_env_value("OPENAI_API_KEY", api_key)
-        if model_name:
-            _set_default_model(config, model_name)
-
-        try:
-            from hermes_cli.auth import deactivate_provider
-
-            deactivate_provider()
-        except Exception:
-            pass
-
-        # Save provider and base_url to config.yaml so the gateway and CLI
-        # both resolve the correct provider without relying on env-var heuristics.
-        if base_url:
-            import yaml
-
-            config_path = (
-                Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-                / "config.yaml"
-            )
-            try:
-                disk_cfg = {}
-                if config_path.exists():
-                    disk_cfg = yaml.safe_load(config_path.read_text()) or {}
-                model_section = disk_cfg.get("model", {})
-                if isinstance(model_section, str):
-                    model_section = {"default": model_section}
-                model_section["provider"] = "custom"
-                model_section["base_url"] = base_url.rstrip("/")
-                if model_name:
-                    model_section["default"] = model_name
-                disk_cfg["model"] = model_section
-                config_path.write_text(yaml.safe_dump(disk_cfg, sort_keys=False))
-            except Exception as e:
-                logger.debug("Could not save provider to config.yaml: %s", e)
-
-            _set_model_provider(config, "custom", base_url)
-
-        print_success("Custom endpoint configured")
+        # Reuse the shared custom endpoint flow from `hermes model`.
+        # This handles: URL/key/model/context-length prompts, endpoint probing,
+        # env saving, config.yaml updates, and custom_providers persistence.
+        from hermes_cli.main import _model_flow_custom
+        _model_flow_custom(config)
+        # _model_flow_custom handles model selection, config, env vars,
+        # and custom_providers. Keep selected_provider = "custom" so
+        # the model selection step below is skipped (line 1631 check)
+        # but vision and TTS setup still run.
 
     elif provider_idx == 4:  # Z.AI / GLM
         selected_provider = "zai"
@@ -1128,7 +1218,40 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "minimax-cn", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    elif provider_idx == 8:  # Anthropic
+    elif provider_idx == 8:  # Kilo Code
+        selected_provider = "kilocode"
+        print()
+        print_header("Kilo Code API Key")
+        pconfig = PROVIDER_REGISTRY["kilocode"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Get your API key at: https://kilo.ai")
+        print()
+
+        existing_key = get_env_value("KILOCODE_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt("  Kilo Code API key", password=True)
+                if api_key:
+                    save_env_value("KILOCODE_API_KEY", api_key)
+                    print_success("Kilo Code API key updated")
+        else:
+            api_key = prompt("  Kilo Code API key", password=True)
+            if api_key:
+                save_env_value("KILOCODE_API_KEY", api_key)
+                print_success("Kilo Code API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "kilocode", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 9:  # Anthropic
         selected_provider = "anthropic"
         print()
         print_header("Anthropic Authentication")
@@ -1232,7 +1355,205 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "anthropic")
         selected_base_url = ""
 
-    # else: provider_idx == 9 (Keep current) — only shown when a provider already exists
+    elif provider_idx == 10:  # AI Gateway
+        selected_provider = "ai-gateway"
+        print()
+        print_header("AI Gateway API Key")
+        pconfig = PROVIDER_REGISTRY["ai-gateway"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info("Get your API key at: https://vercel.com/docs/ai-gateway")
+        print()
+
+        existing_key = get_env_value("AI_GATEWAY_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt("  AI Gateway API key", password=True)
+                if api_key:
+                    save_env_value("AI_GATEWAY_API_KEY", api_key)
+                    print_success("AI Gateway API key updated")
+        else:
+            api_key = prompt("  AI Gateway API key", password=True)
+            if api_key:
+                save_env_value("AI_GATEWAY_API_KEY", api_key)
+                print_success("AI Gateway API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _update_config_for_provider("ai-gateway", pconfig.inference_base_url, default_model="anthropic/claude-opus-4.6")
+        _set_model_provider(config, "ai-gateway", pconfig.inference_base_url)
+
+    elif provider_idx == 11:  # Alibaba Cloud / DashScope
+        selected_provider = "alibaba"
+        print()
+        print_header("Alibaba Cloud / DashScope API Key")
+        pconfig = PROVIDER_REGISTRY["alibaba"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info("Get your API key at: https://modelstudio.console.alibabacloud.com/")
+        print()
+
+        existing_key = get_env_value("DASHSCOPE_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                new_key = prompt("  DashScope API key", password=True)
+                if new_key:
+                    save_env_value("DASHSCOPE_API_KEY", new_key)
+                    print_success("DashScope API key updated")
+        else:
+            new_key = prompt("  DashScope API key", password=True)
+            if new_key:
+                save_env_value("DASHSCOPE_API_KEY", new_key)
+                print_success("DashScope API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _update_config_for_provider("alibaba", pconfig.inference_base_url, default_model="qwen3.5-plus")
+        _set_model_provider(config, "alibaba", pconfig.inference_base_url)
+
+    elif provider_idx == 12:  # OpenCode Zen
+        selected_provider = "opencode-zen"
+        print()
+        print_header("OpenCode Zen API Key")
+        pconfig = PROVIDER_REGISTRY["opencode-zen"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Get your API key at: https://opencode.ai/auth")
+        print()
+
+        existing_key = get_env_value("OPENCODE_ZEN_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt("  OpenCode Zen API key", password=True)
+                if api_key:
+                    save_env_value("OPENCODE_ZEN_API_KEY", api_key)
+                    print_success("OpenCode Zen API key updated")
+        else:
+            api_key = prompt("  OpenCode Zen API key", password=True)
+            if api_key:
+                save_env_value("OPENCODE_ZEN_API_KEY", api_key)
+                print_success("OpenCode Zen API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "opencode-zen", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 13:  # OpenCode Go
+        selected_provider = "opencode-go"
+        print()
+        print_header("OpenCode Go API Key")
+        pconfig = PROVIDER_REGISTRY["opencode-go"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Get your API key at: https://opencode.ai/auth")
+        print()
+
+        existing_key = get_env_value("OPENCODE_GO_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt("  OpenCode Go API key", password=True)
+                if api_key:
+                    save_env_value("OPENCODE_GO_API_KEY", api_key)
+                    print_success("OpenCode Go API key updated")
+        else:
+            api_key = prompt("  OpenCode Go API key", password=True)
+            if api_key:
+                save_env_value("OPENCODE_GO_API_KEY", api_key)
+                print_success("OpenCode Go API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        # Clear custom endpoint vars if switching
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "opencode-go", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 14:  # GitHub Copilot
+        selected_provider = "copilot"
+        print()
+        print_header("GitHub Copilot")
+        pconfig = PROVIDER_REGISTRY["copilot"]
+        print_info("Hermes can use GITHUB_TOKEN, GH_TOKEN, or your gh CLI login.")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print()
+
+        copilot_creds = resolve_api_key_provider_credentials("copilot")
+        source = copilot_creds.get("source", "")
+        token = copilot_creds.get("api_key", "")
+        if token:
+            if source in ("GITHUB_TOKEN", "GH_TOKEN"):
+                print_info(f"Current: {token[:8]}... ({source})")
+            elif source == "gh auth token":
+                print_info("Current: authenticated via `gh auth token`")
+            else:
+                print_info("Current: GitHub token configured")
+        else:
+            api_key = prompt("  GitHub token", password=True)
+            if api_key:
+                save_env_value("GITHUB_TOKEN", api_key)
+                print_success("GitHub token saved")
+            else:
+                print_warning("Skipped - agent won't work without a GitHub token or gh auth login")
+
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "copilot", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 15:  # GitHub Copilot ACP
+        selected_provider = "copilot-acp"
+        print()
+        print_header("GitHub Copilot ACP")
+        pconfig = PROVIDER_REGISTRY["copilot-acp"]
+        print_info("Hermes will start `copilot --acp --stdio` for each request.")
+        print_info("Use HERMES_COPILOT_ACP_COMMAND or COPILOT_CLI_PATH to override the command.")
+        print_info(f"Base marker: {pconfig.inference_base_url}")
+        print()
+
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "copilot-acp", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 16:  # Hugging Face Inference Providers
+        selected_provider = "huggingface"
+        print()
+        print_header("Hugging Face API Token")
+        pconfig = PROVIDER_REGISTRY["huggingface"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info("Get your token at: https://huggingface.co/settings/tokens")
+        print_info("Required permission: 'Make calls to Inference Providers'")
+        print()
+
+        api_key = prompt("  HF Token", password=True)
+        if api_key:
+            save_env_value("HF_TOKEN", api_key)
+            # Clear OpenRouter env vars to prevent routing confusion
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "huggingface", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    # else: provider_idx == 17 (Keep current) — only shown when a provider already exists
     # Normalize "keep current" to an explicit provider so downstream logic
     # doesn't fall back to the generic OpenRouter/static-model path.
     if selected_provider is None:
@@ -1264,11 +1585,14 @@ def setup_model_provider(config: dict):
     if _vision_needs_setup:
         _prov_names = {
             "nous-api": "Nous Portal API key",
+            "copilot": "GitHub Copilot",
+            "copilot-acp": "GitHub Copilot ACP",
             "zai": "Z.AI / GLM",
             "kimi-coding": "Kimi / Moonshot",
             "minimax": "MiniMax",
             "minimax-cn": "MiniMax CN",
             "anthropic": "Anthropic",
+            "ai-gateway": "AI Gateway",
             "custom": "your custom endpoint",
         }
         _prov_display = _prov_names.get(selected_provider, selected_provider or "your provider")
@@ -1402,7 +1726,15 @@ def setup_model_provider(config: dict):
                     _set_default_model(config, custom)
             _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
             _set_model_provider(config, "openai-codex", DEFAULT_CODEX_BASE_URL)
-        elif selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn"):
+        elif selected_provider == "copilot-acp":
+            _setup_provider_model_selection(
+                config, selected_provider, current_model,
+                prompt_choice, prompt,
+            )
+            model_cfg = _model_config_dict(config)
+            model_cfg["api_mode"] = "chat_completions"
+            config["model"] = model_cfg
+        elif selected_provider in ("copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "ai-gateway", "opencode-zen", "opencode-go", "alibaba"):
             _setup_provider_model_selection(
                 config, selected_provider, current_model,
                 prompt_choice, prompt,
@@ -1463,10 +1795,168 @@ def setup_model_provider(config: dict):
     # Write provider+base_url to config.yaml only after model selection is complete.
     # This prevents a race condition where the gateway picks up a new provider
     # before the model name has been updated to match.
-    if selected_provider in ("zai", "kimi-coding", "minimax", "minimax-cn", "anthropic") and selected_base_url is not None:
+    if selected_provider in ("copilot-acp", "copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "anthropic") and selected_base_url is not None:
         _update_config_for_provider(selected_provider, selected_base_url)
 
     save_config(config)
+
+    # Offer TTS provider selection at the end of model setup
+    _setup_tts_provider(config)
+
+
+# =============================================================================
+# Section 1b: TTS Provider Configuration
+# =============================================================================
+
+
+def _check_espeak_ng() -> bool:
+    """Check if espeak-ng is installed."""
+    import shutil
+    return shutil.which("espeak-ng") is not None or shutil.which("espeak") is not None
+
+
+def _install_neutts_deps() -> bool:
+    """Install NeuTTS dependencies with user approval. Returns True on success."""
+    import subprocess
+    import sys
+
+    # Check espeak-ng
+    if not _check_espeak_ng():
+        print()
+        print_warning("NeuTTS requires espeak-ng for phonemization.")
+        if sys.platform == "darwin":
+            print_info("Install with: brew install espeak-ng")
+        elif sys.platform == "win32":
+            print_info("Install with: choco install espeak-ng")
+        else:
+            print_info("Install with: sudo apt install espeak-ng")
+        print()
+        if prompt_yes_no("Install espeak-ng now?", True):
+            try:
+                if sys.platform == "darwin":
+                    subprocess.run(["brew", "install", "espeak-ng"], check=True)
+                elif sys.platform == "win32":
+                    subprocess.run(["choco", "install", "espeak-ng", "-y"], check=True)
+                else:
+                    subprocess.run(["sudo", "apt", "install", "-y", "espeak-ng"], check=True)
+                print_success("espeak-ng installed")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                print_warning(f"Could not install espeak-ng automatically: {e}")
+                print_info("Please install it manually and re-run setup.")
+                return False
+        else:
+            print_warning("espeak-ng is required for NeuTTS. Install it manually before using NeuTTS.")
+
+    # Install neutts Python package
+    print()
+    print_info("Installing neutts Python package...")
+    print_info("This will also download the TTS model (~300MB) on first use.")
+    print()
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "neutts[all]", "--quiet"],
+            check=True, timeout=300,
+        )
+        print_success("neutts installed successfully")
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print_error(f"Failed to install neutts: {e}")
+        print_info("Try manually: python -m pip install -U neutts[all]")
+        return False
+
+
+def _setup_tts_provider(config: dict):
+    """Interactive TTS provider selection with install flow for NeuTTS."""
+    tts_config = config.get("tts", {})
+    current_provider = tts_config.get("provider", "edge")
+
+    provider_labels = {
+        "edge": "Edge TTS",
+        "elevenlabs": "ElevenLabs",
+        "openai": "OpenAI TTS",
+        "neutts": "NeuTTS",
+    }
+    current_label = provider_labels.get(current_provider, current_provider)
+
+    print()
+    print_header("Text-to-Speech Provider (optional)")
+    print_info(f"Current: {current_label}")
+    print()
+
+    choices = [
+        "Edge TTS (free, cloud-based, no setup needed)",
+        "ElevenLabs (premium quality, needs API key)",
+        "OpenAI TTS (good quality, needs API key)",
+        "NeuTTS (local on-device, free, ~300MB model download)",
+        f"Keep current ({current_label})",
+    ]
+    idx = prompt_choice("Select TTS provider:", choices, len(choices) - 1)
+
+    if idx == 4:  # Keep current
+        return
+
+    providers = ["edge", "elevenlabs", "openai", "neutts"]
+    selected = providers[idx]
+
+    if selected == "neutts":
+        # Check if already installed
+        try:
+            import importlib.util
+            already_installed = importlib.util.find_spec("neutts") is not None
+        except Exception:
+            already_installed = False
+
+        if already_installed:
+            print_success("NeuTTS is already installed")
+        else:
+            print()
+            print_info("NeuTTS requires:")
+            print_info("  • Python package: neutts (~50MB install + ~300MB model on first use)")
+            print_info("  • System package: espeak-ng (phonemizer)")
+            print()
+            if prompt_yes_no("Install NeuTTS dependencies now?", True):
+                if not _install_neutts_deps():
+                    print_warning("NeuTTS installation incomplete. Falling back to Edge TTS.")
+                    selected = "edge"
+            else:
+                print_info("Skipping install. Set tts.provider to 'neutts' after installing manually.")
+                selected = "edge"
+
+    elif selected == "elevenlabs":
+        existing = get_env_value("ELEVENLABS_API_KEY")
+        if not existing:
+            print()
+            api_key = prompt("ElevenLabs API key", password=True)
+            if api_key:
+                save_env_value("ELEVENLABS_API_KEY", api_key)
+                print_success("ElevenLabs API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
+    elif selected == "openai":
+        existing = get_env_value("VOICE_TOOLS_OPENAI_KEY")
+        if not existing:
+            print()
+            api_key = prompt("OpenAI API key for TTS", password=True)
+            if api_key:
+                save_env_value("VOICE_TOOLS_OPENAI_KEY", api_key)
+                print_success("OpenAI TTS API key saved")
+            else:
+                print_warning("No API key provided. Falling back to Edge TTS.")
+                selected = "edge"
+
+    # Save the selection
+    if "tts" not in config:
+        config["tts"] = {}
+    config["tts"]["provider"] = selected
+    save_config(config)
+    print_success(f"TTS provider set to: {provider_labels.get(selected, selected)}")
+
+
+def setup_tts(config: dict):
+    """Standalone TTS setup (for 'hermes setup tts')."""
+    _setup_tts_provider(config)
 
 
 # =============================================================================
@@ -1567,7 +2057,7 @@ def setup_terminal_backend(config: dict):
 
         # Docker image
         current_image = config.get("terminal", {}).get(
-            "docker_image", "python:3.11-slim"
+            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
         image = prompt("  Docker image", current_image)
         config["terminal"]["docker_image"] = image
@@ -1589,7 +2079,7 @@ def setup_terminal_backend(config: dict):
             print_info(f"Found: {sing_bin}")
 
         current_image = config.get("terminal", {}).get(
-            "singularity_image", "docker://python:3.11-slim"
+            "singularity_image", "docker://nikolaik/python-nodejs:python3.11-nodejs20"
         )
         image = prompt("  Container image", current_image)
         config["terminal"]["singularity_image"] = image
@@ -1791,7 +2281,7 @@ def setup_agent_settings(config: dict):
     )
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
-    print_info("Recommended: 30-60 for most tasks, 100+ for open exploration.")
+    print_info("Default is 90, which works for most tasks. Use 150+ for open exploration.")
 
     max_iter_str = prompt("Max iterations", current_max)
     try:
@@ -1833,7 +2323,7 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = config.get("compression", {}).get("threshold", 0.85)
+    current_threshold = config.get("compression", {}).get("threshold", 0.50)
     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
     try:
         threshold = float(threshold_str)
@@ -1843,7 +2333,7 @@ def setup_agent_settings(config: dict):
         pass
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.85)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
     )
 
     # ── Session Reset Policy ──
@@ -2180,6 +2670,119 @@ def setup_gateway(config: dict):
                     "   Set SLACK_ALLOW_ALL_USERS=true or GATEWAY_ALLOW_ALL_USERS=true only if you intentionally want open workspace access."
                 )
 
+    # ── Matrix ──
+    existing_matrix = get_env_value("MATRIX_ACCESS_TOKEN") or get_env_value("MATRIX_PASSWORD")
+    if existing_matrix:
+        print_info("Matrix: already configured")
+        if prompt_yes_no("Reconfigure Matrix?", False):
+            existing_matrix = None
+
+    if not existing_matrix and prompt_yes_no("Set up Matrix?", False):
+        print_info("Works with any Matrix homeserver (Synapse, Conduit, Dendrite, or matrix.org).")
+        print_info("   1. Create a bot user on your homeserver, or use your own account")
+        print_info("   2. Get an access token from Element, or provide user ID + password")
+        print()
+        homeserver = prompt("Homeserver URL (e.g. https://matrix.example.org)")
+        if homeserver:
+            save_env_value("MATRIX_HOMESERVER", homeserver.rstrip("/"))
+
+        print()
+        print_info("Auth: provide an access token (recommended), or user ID + password.")
+        token = prompt("Access token (leave empty for password login)", password=True)
+        if token:
+            save_env_value("MATRIX_ACCESS_TOKEN", token)
+            user_id = prompt("User ID (@bot:server — optional, will be auto-detected)")
+            if user_id:
+                save_env_value("MATRIX_USER_ID", user_id)
+            print_success("Matrix access token saved")
+        else:
+            user_id = prompt("User ID (@bot:server)")
+            if user_id:
+                save_env_value("MATRIX_USER_ID", user_id)
+            password = prompt("Password", password=True)
+            if password:
+                save_env_value("MATRIX_PASSWORD", password)
+                print_success("Matrix credentials saved")
+
+        if token or get_env_value("MATRIX_PASSWORD"):
+            # E2EE
+            print()
+            if prompt_yes_no("Enable end-to-end encryption (E2EE)?", False):
+                save_env_value("MATRIX_ENCRYPTION", "true")
+                print_success("E2EE enabled")
+                print_info("   Requires: pip install 'matrix-nio[e2e]'")
+
+            # Allowed users
+            print()
+            print_info("🔒 Security: Restrict who can use your bot")
+            print_info("   Matrix user IDs look like @username:server")
+            print()
+            allowed_users = prompt(
+                "Allowed user IDs (comma-separated, leave empty for open access)"
+            )
+            if allowed_users:
+                save_env_value("MATRIX_ALLOWED_USERS", allowed_users.replace(" ", ""))
+                print_success("Matrix allowlist configured")
+            else:
+                print_info(
+                    "⚠️  No allowlist set - anyone who can message the bot can use it!"
+                )
+
+            # Home room
+            print()
+            print_info("📬 Home Room: where Hermes delivers cron job results and notifications.")
+            print_info("   Room IDs look like !abc123:server (shown in Element room settings)")
+            print_info("   You can also set this later by typing /set-home in a Matrix room.")
+            home_room = prompt("Home room ID (leave empty to set later with /set-home)")
+            if home_room:
+                save_env_value("MATRIX_HOME_ROOM", home_room)
+
+    # ── Mattermost ──
+    existing_mattermost = get_env_value("MATTERMOST_TOKEN")
+    if existing_mattermost:
+        print_info("Mattermost: already configured")
+        if prompt_yes_no("Reconfigure Mattermost?", False):
+            existing_mattermost = None
+
+    if not existing_mattermost and prompt_yes_no("Set up Mattermost?", False):
+        print_info("Works with any self-hosted Mattermost instance.")
+        print_info("   1. In Mattermost: Integrations → Bot Accounts → Add Bot Account")
+        print_info("   2. Copy the bot token")
+        print()
+        mm_url = prompt("Mattermost server URL (e.g. https://mm.example.com)")
+        if mm_url:
+            save_env_value("MATTERMOST_URL", mm_url.rstrip("/"))
+        token = prompt("Bot token", password=True)
+        if token:
+            save_env_value("MATTERMOST_TOKEN", token)
+            print_success("Mattermost token saved")
+
+            # Allowed users
+            print()
+            print_info("🔒 Security: Restrict who can use your bot")
+            print_info("   To find your user ID: click your avatar → Profile")
+            print_info("   or use the API: GET /api/v4/users/me")
+            print()
+            allowed_users = prompt(
+                "Allowed user IDs (comma-separated, leave empty for open access)"
+            )
+            if allowed_users:
+                save_env_value("MATTERMOST_ALLOWED_USERS", allowed_users.replace(" ", ""))
+                print_success("Mattermost allowlist configured")
+            else:
+                print_info(
+                    "⚠️  No allowlist set - anyone who can message the bot can use it!"
+                )
+
+            # Home channel
+            print()
+            print_info("📬 Home Channel: where Hermes delivers cron job results and notifications.")
+            print_info("   To get a channel ID: click channel name → View Info → copy the ID")
+            print_info("   You can also set this later by typing /set-home in a Mattermost channel.")
+            home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
+            if home_channel:
+                save_env_value("MATTERMOST_HOME_CHANNEL", home_channel)
+
     # ── WhatsApp ──
     existing_whatsapp = get_env_value("WHATSAPP_ENABLED")
     if not existing_whatsapp and prompt_yes_no("Set up WhatsApp?", False):
@@ -2192,12 +2795,71 @@ def setup_gateway(config: dict):
             print_info("Run 'hermes whatsapp' to choose your mode (separate bot number")
             print_info("or personal self-chat) and pair via QR code.")
 
+    # ── Webhooks ──
+    existing_webhook = get_env_value("WEBHOOK_ENABLED")
+    if existing_webhook:
+        print_info("Webhooks: already configured")
+        if prompt_yes_no("Reconfigure webhooks?", False):
+            existing_webhook = None
+
+    if not existing_webhook and prompt_yes_no("Set up webhooks? (GitHub, GitLab, etc.)", False):
+        print()
+        print_warning(
+            "⚠  Webhook and SMS platforms require exposing gateway ports to the"
+        )
+        print_warning(
+            "   internet. For security, run the gateway in a sandboxed environment"
+        )
+        print_warning(
+            "   (Docker, VM, etc.) to limit blast radius from prompt injection."
+        )
+        print()
+        print_info(
+            "   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/"
+        )
+        print()
+
+        port = prompt("Webhook port (default 8644)")
+        if port:
+            try:
+                save_env_value("WEBHOOK_PORT", str(int(port)))
+                print_success(f"Webhook port set to {port}")
+            except ValueError:
+                print_warning("Invalid port number, using default 8644")
+
+        secret = prompt("Global HMAC secret (shared across all routes)", password=True)
+        if secret:
+            save_env_value("WEBHOOK_SECRET", secret)
+            print_success("Webhook secret saved")
+        else:
+            print_warning("No secret set — you must configure per-route secrets in config.yaml")
+
+        save_env_value("WEBHOOK_ENABLED", "true")
+        print()
+        print_success("Webhooks enabled! Next steps:")
+        print_info("   1. Define webhook routes in ~/.hermes/config.yaml")
+        print_info("   2. Point your service (GitHub, GitLab, etc.) at:")
+        print_info("      http://your-server:8644/webhooks/<route-name>")
+        print()
+        print_info(
+            "   Route configuration guide:"
+        )
+        print_info(
+            "   https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/#configuring-routes"
+        )
+        print()
+        print_info("   Open config in your editor:  hermes config edit")
+
     # ── Gateway Service Setup ──
     any_messaging = (
         get_env_value("TELEGRAM_BOT_TOKEN")
         or get_env_value("DISCORD_BOT_TOKEN")
         or get_env_value("SLACK_BOT_TOKEN")
+        or get_env_value("MATTERMOST_TOKEN")
+        or get_env_value("MATRIX_ACCESS_TOKEN")
+        or get_env_value("MATRIX_PASSWORD")
         or get_env_value("WHATSAPP_ENABLED")
+        or get_env_value("WEBHOOK_ENABLED")
     )
     if any_messaging:
         print()
@@ -2332,6 +2994,95 @@ def setup_tools(config: dict, first_install: bool = False):
 
 
 # =============================================================================
+# Post-Migration Section Skip Logic
+# =============================================================================
+
+
+def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]:
+    """Return a short summary if a setup section is already configured, else None.
+
+    Used after OpenClaw migration to detect which sections can be skipped.
+    ``get_env_value`` is the module-level import from hermes_cli.config
+    so that test patches on ``setup_mod.get_env_value`` take effect.
+    """
+    if section_key == "model":
+        has_key = bool(
+            get_env_value("OPENROUTER_API_KEY")
+            or get_env_value("OPENAI_API_KEY")
+            or get_env_value("ANTHROPIC_API_KEY")
+        )
+        if not has_key:
+            # Check for OAuth providers
+            try:
+                from hermes_cli.auth import get_active_provider
+                if get_active_provider():
+                    has_key = True
+            except Exception:
+                pass
+        if not has_key:
+            return None
+        model = config.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        if isinstance(model, dict):
+            return str(model.get("default") or model.get("model") or "configured")
+        return "configured"
+
+    elif section_key == "terminal":
+        backend = config.get("terminal", {}).get("backend", "local")
+        return f"backend: {backend}"
+
+    elif section_key == "agent":
+        max_turns = config.get("agent", {}).get("max_turns", 90)
+        return f"max turns: {max_turns}"
+
+    elif section_key == "gateway":
+        platforms = []
+        if get_env_value("TELEGRAM_BOT_TOKEN"):
+            platforms.append("Telegram")
+        if get_env_value("DISCORD_BOT_TOKEN"):
+            platforms.append("Discord")
+        if get_env_value("SLACK_BOT_TOKEN"):
+            platforms.append("Slack")
+        if get_env_value("WHATSAPP_PHONE_NUMBER_ID"):
+            platforms.append("WhatsApp")
+        if get_env_value("SIGNAL_ACCOUNT"):
+            platforms.append("Signal")
+        if platforms:
+            return ", ".join(platforms)
+        return None  # No platforms configured — section must run
+
+    elif section_key == "tools":
+        tools = []
+        if get_env_value("ELEVENLABS_API_KEY"):
+            tools.append("TTS/ElevenLabs")
+        if get_env_value("BROWSERBASE_API_KEY"):
+            tools.append("Browser")
+        if get_env_value("FIRECRAWL_API_KEY"):
+            tools.append("Firecrawl")
+        if tools:
+            return ", ".join(tools)
+        return None
+
+    return None
+
+
+def _skip_configured_section(
+    config: dict, section_key: str, label: str
+) -> bool:
+    """Show an already-configured section summary and offer to skip.
+
+    Returns True if the user chose to skip, False if the section should run.
+    """
+    summary = _get_section_config_summary(config, section_key)
+    if not summary:
+        return False
+    print()
+    print_success(f"  {label}: {summary}")
+    return not prompt_yes_no(f"  Reconfigure {label.lower()}?", default=False)
+
+
+# =============================================================================
 # OpenClaw Migration
 # =============================================================================
 
@@ -2402,7 +3153,7 @@ def _offer_openclaw_migration(hermes_home: Path) -> bool:
             target_root=hermes_home.resolve(),
             execute=True,
             workspace_target=None,
-            overwrite=False,
+            overwrite=True,
             migrate_secrets=True,
             output_dir=None,
             selected_options=selected,
@@ -2445,6 +3196,7 @@ def _offer_openclaw_migration(hermes_home: Path) -> bool:
 
 SETUP_SECTIONS = [
     ("model", "Model & Provider", setup_model_provider),
+    ("tts", "Text-to-Speech", setup_tts),
     ("terminal", "Terminal Backend", setup_terminal_backend),
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
     ("tools", "Tools", setup_tools),
@@ -2463,6 +3215,10 @@ def run_setup_wizard(args):
       hermes setup tools     — just tool configuration
       hermes setup agent     — just agent settings
     """
+    from hermes_cli.config import is_managed, managed_error
+    if is_managed():
+        managed_error("run setup wizard")
+        return
     ensure_hermes_home()
 
     config = load_config()
@@ -2553,6 +3309,8 @@ def run_setup_wizard(args):
         )
     )
 
+    migration_ran = False
+
     if is_existing:
         # ── Returning User Menu ──
         print()
@@ -2592,12 +3350,17 @@ def run_setup_wizard(args):
             print_info("Exiting. Run 'hermes setup' again when ready.")
             return
         elif 3 <= choice <= 7:
-            # Individual section
-            section_idx = choice - 3
-            _, label, func = SETUP_SECTIONS[section_idx]
-            func(config)
-            save_config(config)
-            _print_setup_summary(config, hermes_home)
+            # Individual section — map by key, not by position.
+            # SETUP_SECTIONS includes TTS but the returning-user menu skips it,
+            # so positional indexing (choice - 3) would dispatch the wrong section.
+            _RETURNING_USER_SECTION_KEYS = ["model", "terminal", "gateway", "tools", "agent"]
+            section_key = _RETURNING_USER_SECTION_KEYS[choice - 3]
+            section = next((s for s in SETUP_SECTIONS if s[0] == section_key), None)
+            if section:
+                _, label, func = section
+                func(config)
+                save_config(config)
+                _print_setup_summary(config, hermes_home)
             return
     else:
         # ── First-Time Setup ──
@@ -2605,9 +3368,9 @@ def run_setup_wizard(args):
         print_info("We'll walk you through:")
         print_info("  1. Model & Provider — choose your AI provider and model")
         print_info("  2. Terminal Backend — where your agent runs commands")
-        print_info("  3. Messaging Platforms — connect Telegram, Discord, etc.")
-        print_info("  4. Tools — configure TTS, web search, image generation, etc.")
-        print_info("  5. Agent Settings — iterations, compression, session reset")
+        print_info("  3. Agent Settings — iterations, compression, session reset")
+        print_info("  4. Messaging Platforms — connect Telegram, Discord, etc.")
+        print_info("  5. Tools — configure TTS, web search, image generation, etc.")
         print()
         print_info("Press Enter to begin, or Ctrl+C to exit.")
         try:
@@ -2617,7 +3380,8 @@ def run_setup_wizard(args):
             return
 
         # Offer OpenClaw migration before configuration begins
-        if _offer_openclaw_migration(hermes_home):
+        migration_ran = _offer_openclaw_migration(hermes_home)
+        if migration_ran:
             # Reload config in case migration wrote to it
             config = load_config()
 
@@ -2630,20 +3394,31 @@ def run_setup_wizard(args):
     print()
     print_info("You can edit these files directly or use 'hermes config edit'")
 
+    if migration_ran:
+        print()
+        print_info("Settings were imported from OpenClaw.")
+        print_info("Each section below will show what was imported — press Enter to keep,")
+        print_info("or choose to reconfigure if needed.")
+
     # Section 1: Model & Provider
-    setup_model_provider(config)
+    if not (migration_ran and _skip_configured_section(config, "model", "Model & Provider")):
+        setup_model_provider(config)
 
     # Section 2: Terminal Backend
-    setup_terminal_backend(config)
+    if not (migration_ran and _skip_configured_section(config, "terminal", "Terminal Backend")):
+        setup_terminal_backend(config)
 
     # Section 3: Agent Settings
-    setup_agent_settings(config)
+    if not (migration_ran and _skip_configured_section(config, "agent", "Agent Settings")):
+        setup_agent_settings(config)
 
     # Section 4: Messaging Platforms
-    setup_gateway(config)
+    if not (migration_ran and _skip_configured_section(config, "gateway", "Messaging Platforms")):
+        setup_gateway(config)
 
     # Section 5: Tools
-    setup_tools(config, first_install=not is_existing)
+    if not (migration_ran and _skip_configured_section(config, "tools", "Tools")):
+        setup_tools(config, first_install=not is_existing)
 
     # Save and show summary
     save_config(config)
@@ -2656,7 +3431,6 @@ def _run_quick_setup(config: dict, hermes_home):
         get_missing_env_vars,
         get_missing_config_fields,
         check_config_version,
-        migrate_config,
     )
 
     print()
@@ -2795,9 +3569,9 @@ def _run_quick_setup(config: dict, hermes_home):
                     value = prompt(f"  {var.get('prompt', var['name'])}")
                 if value:
                     save_env_value(var["name"], value)
-                    print_success(f"  ✓ Saved")
+                    print_success("  ✓ Saved")
                 else:
-                    print_warning(f"  Skipped")
+                    print_warning("  Skipped")
                 print()
 
     # Handle missing config fields

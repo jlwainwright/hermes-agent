@@ -14,6 +14,8 @@ import json
 import logging
 import os
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,6 +34,54 @@ ADAPTIVE_EFFORT_MAP = {
     "low": "low",
     "minimal": "low",
 }
+
+# ── Max output token limits per Anthropic model ───────────────────────
+# Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
+# max_tokens as a mandatory field.  Previously we hardcoded 16384, which
+# starves thinking-enabled models (thinking tokens count toward the limit).
+_ANTHROPIC_OUTPUT_LIMITS = {
+    # Claude 4.6
+    "claude-opus-4-6":   128_000,
+    "claude-sonnet-4-6":  64_000,
+    # Claude 4.5
+    "claude-opus-4-5":    64_000,
+    "claude-sonnet-4-5":  64_000,
+    "claude-haiku-4-5":   64_000,
+    # Claude 4
+    "claude-opus-4":      32_000,
+    "claude-sonnet-4":    64_000,
+    # Claude 3.7
+    "claude-3-7-sonnet": 128_000,
+    # Claude 3.5
+    "claude-3-5-sonnet":   8_192,
+    "claude-3-5-haiku":    8_192,
+    # Claude 3
+    "claude-3-opus":       4_096,
+    "claude-3-sonnet":     4_096,
+    "claude-3-haiku":      4_096,
+}
+
+# For any model not in the table, assume the highest current limit.
+# Future Anthropic models are unlikely to have *less* output capacity.
+_ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000
+
+
+def _get_anthropic_max_output(model: str) -> int:
+    """Look up the max output token limit for an Anthropic model.
+
+    Uses substring matching against _ANTHROPIC_OUTPUT_LIMITS so date-stamped
+    model IDs (claude-sonnet-4-5-20250929) and variant suffixes (:1m, :fast)
+    resolve correctly.  Longest-prefix match wins to avoid e.g. "claude-3-5"
+    matching before "claude-3-5-sonnet".
+    """
+    m = model.lower()
+    best_key = ""
+    best_val = _ANTHROPIC_DEFAULT_OUTPUT_LIMIT
+    for key, val in _ANTHROPIC_OUTPUT_LIMITS.items():
+        if key in m and len(key) > len(best_key):
+            best_key = key
+            best_val = val
+    return best_val
 
 
 def _supports_adaptive_thinking(model: str) -> bool:
@@ -54,9 +104,47 @@ _OAUTH_ONLY_BETAS = [
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
-_CLAUDE_CODE_VERSION = "2.1.2"
+# The version must stay reasonably current — Anthropic rejects OAuth requests
+# when the spoofed user-agent version is too far behind the actual release.
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_claude_code_version_cache: Optional[str] = None
+
+
+def _detect_claude_code_version() -> str:
+    """Detect the installed Claude Code version, fall back to a static constant.
+
+    Anthropic's OAuth infrastructure validates the user-agent version and may
+    reject requests with a version that's too old.  Detecting dynamically means
+    users who keep Claude Code updated never hit stale-version 400s.
+    """
+    import subprocess as _sp
+
+    for cmd in ("claude", "claude-code"):
+        try:
+            result = _sp.run(
+                [cmd, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Output is like "2.1.74 (Claude Code)" or just "2.1.74"
+                version = result.stdout.strip().split()[0]
+                if version and version[0].isdigit():
+                    return version
+        except Exception:
+            pass
+    return _CLAUDE_CODE_VERSION_FALLBACK
+
+
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp_"
+
+
+def _get_claude_code_version() -> str:
+    """Lazily detect the installed Claude Code version when OAuth headers need it."""
+    global _claude_code_version_cache
+    if _claude_code_version_cache is None:
+        _claude_code_version_cache = _detect_claude_code_version()
+    return _claude_code_version_cache
 
 
 def _is_oauth_token(key: str) -> bool:
@@ -100,7 +188,7 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_CLAUDE_CODE_VERSION} (external, cli)",
+            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
         }
     else:
@@ -178,9 +266,12 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     Only works for credentials that have a refresh token (from claude /login
     or claude setup-token with OAuth flow).
 
+    Tries the new platform.claude.com endpoint first (Claude Code >=2.1.81),
+    then falls back to console.anthropic.com for older tokens.
+
     Returns the new access token, or None if refresh fails.
     """
-    import urllib.parse
+    import time
     import urllib.request
 
     refresh_token = creds.get("refreshToken", "")
@@ -191,35 +282,42 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     # Client ID used by Claude Code's OAuth flow
     CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-    data = urllib.parse.urlencode({
+    # Anthropic migrated OAuth from console.anthropic.com to platform.claude.com
+    # (Claude Code v2.1.81+). Try new endpoint first, fall back to old.
+    token_endpoints = [
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    ]
+
+    payload = json.dumps({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
     }).encode()
 
-    req = urllib.request.Request(
-        "https://console.anthropic.com/v1/oauth/token",
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+    }
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            new_access = result.get("access_token", "")
-            new_refresh = result.get("refresh_token", refresh_token)
-            expires_in = result.get("expires_in", 3600)  # seconds
+    for endpoint in token_endpoints:
+        req = urllib.request.Request(
+            endpoint, data=payload, headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                new_access = result.get("access_token", "")
+                new_refresh = result.get("refresh_token", refresh_token)
+                expires_in = result.get("expires_in", 3600)
 
-            if new_access:
-                import time
-                new_expires_ms = int(time.time() * 1000) + (expires_in * 1000)
-                # Write refreshed credentials back to ~/.claude/.credentials.json
-                _write_claude_code_credentials(new_access, new_refresh, new_expires_ms)
-                logger.debug("Successfully refreshed Claude Code OAuth token")
-                return new_access
-    except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
+                if new_access:
+                    new_expires_ms = int(time.time() * 1000) + (expires_in * 1000)
+                    _write_claude_code_credentials(new_access, new_refresh, new_expires_ms)
+                    logger.debug("Refreshed Claude Code OAuth token via %s", endpoint)
+                    return new_access
+        except Exception as e:
+            logger.debug("Token refresh failed at %s: %s", endpoint, e)
 
     return None
 
@@ -397,24 +495,32 @@ def run_oauth_setup_token() -> Optional[str]:
     return None
 
 
+
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Message / tool / response format conversion
 # ---------------------------------------------------------------------------
 
 
-def normalize_model_name(model: str) -> str:
+def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     """Normalize a model name for the Anthropic API.
 
     - Strips 'anthropic/' prefix (OpenRouter format, case-insensitive)
     - Converts dots to hyphens in version numbers (OpenRouter uses dots,
-      Anthropic uses hyphens: claude-opus-4.6 → claude-opus-4-6)
+      Anthropic uses hyphens: claude-opus-4.6 → claude-opus-4-6), unless
+      preserve_dots is True (e.g. for Alibaba/DashScope: qwen3.5-plus).
     """
     lower = model.lower()
     if lower.startswith("anthropic/"):
         model = model[len("anthropic/"):]
-    # OpenRouter uses dots for version separators (claude-opus-4.6),
-    # Anthropic uses hyphens (claude-opus-4-6). Convert dots to hyphens.
-    model = model.replace(".", "-")
+    if not preserve_dots:
+        # OpenRouter uses dots for version separators (claude-opus-4.6),
+        # Anthropic uses hyphens (claude-opus-4-6). Convert dots to hyphens.
+        model = model.replace(".", "-")
     return model
 
 
@@ -610,6 +716,8 @@ def convert_messages_to_anthropic(
                 else:
                     blocks.append({"type": "text", "text": str(content)})
             for tc in m.get("tool_calls", []):
+                if not tc or not isinstance(tc, dict):
+                    continue
                 fn = tc.get("function", {})
                 args = fn.get("arguments", "{}")
                 try:
@@ -654,14 +762,21 @@ def convert_messages_to_anthropic(
                 result.append({"role": "user", "content": [tool_result]})
             continue
 
-        # Regular user message
+        # Regular user message — validate non-empty content (Anthropic rejects empty)
         if isinstance(content, list):
             converted_blocks = _convert_content_to_anthropic(content)
-            result.append({
-                "role": "user",
-                "content": converted_blocks or [{"type": "text", "text": ""}],
-            })
+            # Check if all text blocks are empty
+            if not converted_blocks or all(
+                b.get("text", "").strip() == ""
+                for b in converted_blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            ):
+                converted_blocks = [{"type": "text", "text": "(empty message)"}]
+            result.append({"role": "user", "content": converted_blocks})
         else:
+            # Validate string content is non-empty
+            if not content or (isinstance(content, str) and not content.strip()):
+                content = "(empty message)"
             result.append({"role": "user", "content": content})
 
     # Strip orphaned tool_use blocks (no matching tool_result follows)
@@ -680,6 +795,26 @@ def convert_messages_to_anthropic(
             ]
             if not m["content"]:
                 m["content"] = [{"type": "text", "text": "(tool call removed)"}]
+
+    # Strip orphaned tool_result blocks (no matching tool_use precedes them).
+    # This is the mirror of the above: context compression or session truncation
+    # can remove an assistant message containing a tool_use while leaving the
+    # subsequent tool_result intact.  Anthropic rejects these with a 400.
+    tool_use_ids = set()
+    for m in result:
+        if m["role"] == "assistant" and isinstance(m["content"], list):
+            for block in m["content"]:
+                if block.get("type") == "tool_use":
+                    tool_use_ids.add(block.get("id"))
+    for m in result:
+        if m["role"] == "user" and isinstance(m["content"], list):
+            m["content"] = [
+                b
+                for b in m["content"]
+                if b.get("type") != "tool_result" or b.get("tool_use_id") in tool_use_ids
+            ]
+            if not m["content"]:
+                m["content"] = [{"type": "text", "text": "(tool result removed)"}]
 
     # Enforce strict role alternation (Anthropic rejects consecutive same-role messages)
     fixed = []
@@ -709,8 +844,12 @@ def convert_messages_to_anthropic(
                 elif isinstance(prev_blocks, str) and isinstance(curr_blocks, str):
                     fixed[-1]["content"] = prev_blocks + "\n" + curr_blocks
                 else:
-                    # Keep the later message
-                    fixed[-1] = m
+                    # Mixed types — normalize both to list and merge
+                    if isinstance(prev_blocks, str):
+                        prev_blocks = [{"type": "text", "text": prev_blocks}]
+                    if isinstance(curr_blocks, str):
+                        curr_blocks = [{"type": "text", "text": curr_blocks}]
+                    fixed[-1]["content"] = prev_blocks + curr_blocks
         else:
             fixed.append(m)
     result = fixed
@@ -726,17 +865,32 @@ def build_anthropic_kwargs(
     reasoning_config: Optional[Dict[str, Any]],
     tool_choice: Optional[str] = None,
     is_oauth: bool = False,
+    preserve_dots: bool = False,
+    context_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
+    When *max_tokens* is None, the model's native output limit is used
+    (e.g. 128K for Opus 4.6, 64K for Sonnet 4.6).  If *context_length*
+    is provided, the effective limit is clamped so it doesn't exceed
+    the context window.
+
     When *is_oauth* is True, applies Claude Code compatibility transforms:
     system prompt prefix, tool name prefixing, and prompt sanitization.
+
+    When *preserve_dots* is True, model name dots are not converted to hyphens
+    (for Alibaba/DashScope anthropic-compatible endpoints: qwen3.5-plus).
     """
     system, anthropic_messages = convert_messages_to_anthropic(messages)
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
 
-    model = normalize_model_name(model)
-    effective_max_tokens = max_tokens or 16384
+    model = normalize_model_name(model, preserve_dots=preserve_dots)
+    effective_max_tokens = max_tokens or _get_anthropic_max_output(model)
+
+    # Clamp to context window if the user set a lower context_length
+    # (e.g. custom endpoint with limited capacity).
+    if context_length and effective_max_tokens > context_length:
+        effective_max_tokens = max(context_length - 1, 1)
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
@@ -795,7 +949,8 @@ def build_anthropic_kwargs(
         elif tool_choice == "required":
             kwargs["tool_choice"] = {"type": "any"}
         elif tool_choice == "none":
-            pass  # Don't send tool_choice — Anthropic will use tools if needed
+            # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
+            kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}

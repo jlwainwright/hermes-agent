@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,8 @@ DANGEROUS_PATTERNS = [
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
-    (r'\b(bash|sh|zsh)\s+-c\s+', "shell command via -c flag"),
+    # Any shell invocation via -c or combined flags like -lc, -ic, etc.
+    (r'\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)', "shell command via -c/-lc flag"),
     (r'\b(python[23]?|perl|ruby|node)\s+-[ec]\s+', "script execution via -e/-c flag"),
     (r'\b(curl|wget)\b.*\|\s*(ba)?sh\b', "pipe remote content to shell"),
     (r'\b(bash|sh|zsh|ksh)\s+<\s*<?\s*\(\s*(curl|wget)\b', "execute remote script via process substitution"),
@@ -48,6 +50,9 @@ DANGEROUS_PATTERNS = [
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
     (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
+    # Gateway protection: never start gateway outside systemd management
+    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
 ]
 
 
@@ -78,13 +83,31 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
+def _normalize_command_for_detection(command: str) -> str:
+    """Normalize a command string before dangerous-pattern matching.
+
+    Strips ANSI escape sequences (full ECMA-48 via tools.ansi_strip),
+    null bytes, and normalizes Unicode fullwidth characters so that
+    obfuscation techniques cannot bypass the pattern-based detection.
+    """
+    from tools.ansi_strip import strip_ansi
+
+    # Strip all ANSI escape sequences (CSI, OSC, DCS, 8-bit C1, etc.)
+    command = strip_ansi(command)
+    # Strip null bytes
+    command = command.replace('\x00', '')
+    # Normalize Unicode (fullwidth Latin, halfwidth Katakana, etc.)
+    command = unicodedata.normalize('NFKC', command)
+    return command
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    command_lower = command.lower()
+    command_lower = _normalize_command_for_detection(command).lower()
     for pattern, description in DANGEROUS_PATTERNS:
         if re.search(pattern, command_lower, re.IGNORECASE | re.DOTALL):
             pattern_key = description
@@ -220,17 +243,15 @@ def prompt_dangerous_approval(command: str, description: str,
 
     os.environ["HERMES_SPINNER_PAUSE"] = "1"
     try:
-        is_truncated = len(command) > 80
         while True:
             print()
             print(f"  ⚠️  DANGEROUS COMMAND: {description}")
-            print(f"      {command[:80]}{'...' if is_truncated else ''}")
+            print(f"      {command}")
             print()
-            view_hint = "  |  [v]iew full" if is_truncated else ""
             if allow_permanent:
-                print(f"      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny{view_hint}")
+                print("      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny")
             else:
-                print(f"      [o]nce  |  [s]ession  |  [d]eny{view_hint}")
+                print("      [o]nce  |  [s]ession  |  [d]eny")
             print()
             sys.stdout.flush()
 
@@ -252,12 +273,6 @@ def prompt_dangerous_approval(command: str, description: str,
                 return "deny"
 
             choice = result["choice"]
-            if choice in ('v', 'view') and is_truncated:
-                print()
-                print("      Full command:")
-                print(f"      {command}")
-                is_truncated = False
-                continue
             if choice in ('o', 'once'):
                 print("      ✓ Allowed once")
                 return "once"
@@ -284,12 +299,28 @@ def prompt_dangerous_approval(command: str, description: str,
         sys.stdout.flush()
 
 
+def _normalize_approval_mode(mode) -> str:
+    """Normalize approval mode values loaded from YAML/config.
+
+    YAML 1.1 treats bare words like `off` as booleans, so a config entry like
+    `approvals:\n  mode: off` is parsed as False unless quoted. Treat that as the
+    intended string mode instead of falling back to manual approvals.
+    """
+    if isinstance(mode, bool):
+        return "off" if mode is False else "manual"
+    if isinstance(mode, str):
+        normalized = mode.strip().lower()
+        return normalized or "manual"
+    return "manual"
+
+
 def _get_approval_mode() -> str:
     """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
     try:
         from hermes_cli.config import load_config
         config = load_config()
-        return config.get("approvals", {}).get("mode", "manual")
+        mode = config.get("approvals", {}).get("mode", "manual")
+        return _normalize_approval_mode(mode)
     except Exception:
         return "manual"
 
@@ -394,7 +425,10 @@ def check_dangerous_command(command: str, env_type: str,
             "status": "approval_required",
             "command": command,
             "description": description,
-            "message": f"⚠️ This command is potentially dangerous ({description}). Asking the user for approval...",
+            "message": (
+                f"⚠️ This command is potentially dangerous ({description}). "
+                f"Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
+            ),
         }
 
     choice = prompt_dangerous_approval(command, description,
@@ -421,6 +455,33 @@ def check_dangerous_command(command: str, env_type: str,
 # =========================================================================
 # Combined pre-exec guard (tirith + dangerous command detection)
 # =========================================================================
+
+def _format_tirith_description(tirith_result: dict) -> str:
+    """Build a human-readable description from tirith findings.
+
+    Includes severity, title, and description for each finding so users
+    can make an informed approval decision.
+    """
+    findings = tirith_result.get("findings") or []
+    if not findings:
+        summary = tirith_result.get("summary") or "security issue detected"
+        return f"Security scan: {summary}"
+
+    parts = []
+    for f in findings:
+        severity = f.get("severity", "")
+        title = f.get("title", "")
+        desc = f.get("description", "")
+        if title and desc:
+            parts.append(f"[{severity}] {title}: {desc}" if severity else f"{title}: {desc}")
+        elif title:
+            parts.append(f"[{severity}] {title}" if severity else title)
+    if not parts:
+        summary = tirith_result.get("summary") or "security issue detected"
+        return f"Security scan: {summary}"
+
+    return "Security scan — " + "; ".join(parts)
+
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None) -> dict:
@@ -465,24 +526,20 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --- Phase 2: Decide ---
 
-    # If tirith blocks, block immediately (no approval possible)
-    if tirith_result["action"] == "block":
-        summary = tirith_result.get("summary") or "security issue detected"
-        return {
-            "approved": False,
-            "message": f"BLOCKED: Command blocked by security scan ({summary}). Do NOT retry.",
-        }
-
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
     session_key = os.getenv("HERMES_SESSION_KEY", "default")
 
-    if tirith_result["action"] == "warn":
+    # Tirith block/warn → approvable warning with rich findings.
+    # Previously, tirith "block" was a hard block with no approval prompt.
+    # Now both block and warn go through the approval flow so users can
+    # inspect the explanation and approve if they understand the risk.
+    if tirith_result["action"] in ("block", "warn"):
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
-        tirith_desc = f"Security scan: {tirith_result.get('summary') or 'security warning detected'}"
+        tirith_desc = _format_tirith_description(tirith_result)
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
@@ -542,7 +599,9 @@ def check_all_command_guards(command: str, env_type: str,
             "status": "approval_required",
             "command": command,
             "description": combined_desc,
-            "message": f"⚠️ {combined_desc}. Asking the user for approval...",
+            "message": (
+                f"⚠️ {combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
+            ),
         }
 
     # CLI interactive: single combined prompt

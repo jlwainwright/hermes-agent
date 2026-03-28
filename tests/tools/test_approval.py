@@ -4,6 +4,7 @@ from unittest.mock import patch as mock_patch
 
 import tools.approval as approval_module
 from tools.approval import (
+    _get_approval_mode,
     approve_session,
     clear_session,
     detect_dangerous_command,
@@ -14,6 +15,16 @@ from tools.approval import (
     prompt_dangerous_approval,
     submit_pending,
 )
+
+
+class TestApprovalModeParsing:
+    def test_unquoted_yaml_off_boolean_false_maps_to_off(self):
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):
+            assert _get_approval_mode() == "off"
+
+    def test_string_off_still_maps_to_off(self):
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "off"}}):
+            assert _get_approval_mode() == "off"
 
 
 class TestDetectDangerousRm:
@@ -42,6 +53,25 @@ class TestDetectDangerousSudo:
         assert is_dangerous is True
         assert key is not None
         assert "pipe" in desc.lower() or "shell" in desc.lower()
+
+    def test_shell_via_lc_flag(self):
+        """bash -lc should be treated as dangerous just like bash -c."""
+        is_dangerous, key, desc = detect_dangerous_command("bash -lc 'echo pwned'")
+        assert is_dangerous is True
+        assert key is not None
+
+    def test_shell_via_lc_with_newline(self):
+        """Multi-line bash -lc invocations must still be detected."""
+        cmd = "bash -lc \\\n'echo pwned'"
+        is_dangerous, key, desc = detect_dangerous_command(cmd)
+        assert is_dangerous is True
+        assert key is not None
+
+    def test_ksh_via_c_flag(self):
+        """ksh -c should be caught by the expanded pattern."""
+        is_dangerous, key, desc = detect_dangerous_command("ksh -c 'echo test'")
+        assert is_dangerous is True
+        assert key is not None
 
 
 class TestDetectSqlPatterns:
@@ -385,75 +415,47 @@ class TestPatternKeyUniqueness:
             assert is_approved("legacy-find", key_delete) is True
 
 
-class TestViewFullCommand:
-    """Tests for the 'view full command' option in prompt_dangerous_approval."""
+class TestFullCommandAlwaysShown:
+    """The full command is always shown in the approval prompt (no truncation).
 
-    def test_view_then_once_fallback(self):
-        """Pressing 'v' shows the full command, then 'o' approves once."""
+    Previously there was a [v]iew full option for long commands. Now the full
+    command is always displayed. These tests verify the basic approval flow
+    still works with long commands. (#1553)
+    """
+
+    def test_once_with_long_command(self):
+        """Pressing 'o' approves once even for very long commands."""
         long_cmd = "rm -rf " + "a" * 200
-        inputs = iter(["v", "o"])
-        with mock_patch("builtins.input", side_effect=inputs):
-            result = prompt_dangerous_approval(long_cmd, "recursive delete")
-        assert result == "once"
-
-    def test_view_then_deny_fallback(self):
-        """Pressing 'v' shows the full command, then 'd' denies."""
-        long_cmd = "rm -rf " + "b" * 200
-        inputs = iter(["v", "d"])
-        with mock_patch("builtins.input", side_effect=inputs):
-            result = prompt_dangerous_approval(long_cmd, "recursive delete")
-        assert result == "deny"
-
-    def test_view_then_session_fallback(self):
-        """Pressing 'v' shows the full command, then 's' approves for session."""
-        long_cmd = "rm -rf " + "c" * 200
-        inputs = iter(["v", "s"])
-        with mock_patch("builtins.input", side_effect=inputs):
-            result = prompt_dangerous_approval(long_cmd, "recursive delete")
-        assert result == "session"
-
-    def test_view_then_always_fallback(self):
-        """Pressing 'v' shows the full command, then 'a' approves always."""
-        long_cmd = "rm -rf " + "d" * 200
-        inputs = iter(["v", "a"])
-        with mock_patch("builtins.input", side_effect=inputs):
-            result = prompt_dangerous_approval(long_cmd, "recursive delete")
-        assert result == "always"
-
-    def test_view_then_session_when_permanent_hidden(self):
-        """The view-full flow still works when allow_permanent=False."""
-        long_cmd = "rm -rf " + "d" * 200
-        inputs = iter(["v", "s"])
-        with mock_patch("builtins.input", side_effect=inputs):
-            result = prompt_dangerous_approval(
-                long_cmd,
-                "recursive delete",
-                allow_permanent=False,
-            )
-        assert result == "session"
-
-    def test_view_not_shown_for_short_command(self):
-        """Short commands don't offer the view option; 'v' falls through to deny."""
-        short_cmd = "rm -rf /tmp"
-        with mock_patch("builtins.input", return_value="v"):
-            result = prompt_dangerous_approval(short_cmd, "recursive delete")
-        # 'v' is not a valid choice for short commands, should deny
-        assert result == "deny"
-
-    def test_once_without_view(self):
-        """Directly pressing 'o' without viewing still works."""
-        long_cmd = "rm -rf " + "e" * 200
         with mock_patch("builtins.input", return_value="o"):
             result = prompt_dangerous_approval(long_cmd, "recursive delete")
         assert result == "once"
 
-    def test_view_ignored_after_already_shown(self):
-        """After viewing once, 'v' on a now-untruncated display falls through to deny."""
-        long_cmd = "rm -rf " + "f" * 200
-        inputs = iter(["v", "v"])  # second 'v' should not match since is_truncated is False
-        with mock_patch("builtins.input", side_effect=inputs):
+    def test_session_with_long_command(self):
+        """Pressing 's' approves for session with long commands."""
+        long_cmd = "rm -rf " + "c" * 200
+        with mock_patch("builtins.input", return_value="s"):
             result = prompt_dangerous_approval(long_cmd, "recursive delete")
-        # After first 'v', is_truncated becomes False, so second 'v' -> deny
+        assert result == "session"
+
+    def test_always_with_long_command(self):
+        """Pressing 'a' approves always with long commands."""
+        long_cmd = "rm -rf " + "d" * 200
+        with mock_patch("builtins.input", return_value="a"):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "always"
+
+    def test_deny_with_long_command(self):
+        """Pressing 'd' denies with long commands."""
+        long_cmd = "rm -rf " + "b" * 200
+        with mock_patch("builtins.input", return_value="d"):
+            result = prompt_dangerous_approval(long_cmd, "recursive delete")
+        assert result == "deny"
+
+    def test_invalid_input_denies(self):
+        """Invalid input (like 'v' which no longer exists) falls through to deny."""
+        short_cmd = "rm -rf /tmp"
+        with mock_patch("builtins.input", return_value="v"):
+            result = prompt_dangerous_approval(short_cmd, "recursive delete")
         assert result == "deny"
 
 
@@ -471,5 +473,112 @@ class TestForkBombDetection:
 
     def test_colon_in_safe_command_not_flagged(self):
         dangerous, key, desc = detect_dangerous_command("echo hello:world")
+        assert dangerous is False
+
+
+class TestGatewayProtection:
+    """Prevent agents from starting the gateway outside systemd management."""
+
+    def test_gateway_run_with_disown_detected(self):
+        cmd = "kill 1605 && cd ~/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown; echo done"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "systemctl" in desc
+
+    def test_gateway_run_with_ampersand_detected(self):
+        cmd = "python -m hermes_cli.main gateway run --replace &"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_gateway_run_with_nohup_detected(self):
+        cmd = "nohup python -m hermes_cli.main gateway run --replace"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_gateway_run_with_setsid_detected(self):
+        cmd = "hermes_cli.main gateway run --replace &disown"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_gateway_run_foreground_not_flagged(self):
+        """Normal foreground gateway run (as in systemd ExecStart) is fine."""
+        cmd = "python -m hermes_cli.main gateway run --replace"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_systemctl_restart_not_flagged(self):
+        """Using systemctl to manage the gateway is the correct approach."""
+        cmd = "systemctl --user restart hermes-gateway"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+
+class TestNormalizationBypass:
+    """Obfuscation techniques must not bypass dangerous command detection."""
+
+    def test_fullwidth_unicode_rm(self):
+        """Fullwidth Unicode 'ｒｍ -ｒｆ /' must be caught after NFKC normalization."""
+        cmd = "\uff52\uff4d -\uff52\uff46 /"  # ｒｍ -ｒｆ /
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, f"Fullwidth 'rm -rf /' was not detected: {cmd!r}"
+
+    def test_fullwidth_unicode_dd(self):
+        """Fullwidth 'ｄｄ if=/dev/zero' must be caught."""
+        cmd = "\uff44\uff44 if=/dev/zero of=/dev/sda"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_fullwidth_unicode_chmod(self):
+        """Fullwidth 'ｃｈｍｏｄ 777' must be caught."""
+        cmd = "\uff43\uff48\uff4d\uff4f\uff44 777 /tmp/test"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_ansi_csi_wrapped_rm(self):
+        """ANSI CSI color codes wrapping 'rm' must be stripped and caught."""
+        cmd = "\x1b[31mrm\x1b[0m -rf /"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, f"ANSI-wrapped 'rm -rf /' was not detected"
+
+    def test_ansi_osc_embedded_rm(self):
+        """ANSI OSC sequences embedded in command must be stripped."""
+        cmd = "\x1b]0;title\x07rm -rf /"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_ansi_8bit_c1_wrapped_rm(self):
+        """8-bit C1 CSI (0x9b) wrapping 'rm' must be stripped and caught."""
+        cmd = "\x9b31mrm\x9b0m -rf /"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, "8-bit C1 CSI bypass was not caught"
+
+    def test_null_byte_in_rm(self):
+        """Null bytes injected into 'rm' must be stripped and caught."""
+        cmd = "r\x00m -rf /"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, f"Null-byte 'rm' was not detected: {cmd!r}"
+
+    def test_null_byte_in_dd(self):
+        """Null bytes in 'dd' must be stripped."""
+        cmd = "d\x00d if=/dev/sda"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_mixed_fullwidth_and_ansi(self):
+        """Combined fullwidth + ANSI obfuscation must still be caught."""
+        cmd = "\x1b[1m\uff52\uff4d\x1b[0m -rf /"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_safe_command_after_normalization(self):
+        """Normal safe commands must not be flagged after normalization."""
+        cmd = "ls -la /tmp"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_fullwidth_safe_command_not_flagged(self):
+        """Fullwidth 'ｌｓ -ｌａ' is safe and must not be flagged."""
+        cmd = "\uff4c\uff53 -\uff4c\uff41 /tmp"
+        dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 

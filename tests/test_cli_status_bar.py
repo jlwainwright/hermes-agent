@@ -16,6 +16,10 @@ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
 def _attach_agent(
     cli_obj,
     *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
     prompt_tokens: int,
     completion_tokens: int,
     total_tokens: int,
@@ -26,6 +30,12 @@ def _attach_agent(
 ):
     cli_obj.agent = SimpleNamespace(
         model=cli_obj.model,
+        provider="anthropic" if cli_obj.model.startswith("anthropic/") else None,
+        base_url="",
+        session_input_tokens=input_tokens if input_tokens is not None else prompt_tokens,
+        session_output_tokens=output_tokens if output_tokens is not None else completion_tokens,
+        session_cache_read_tokens=cache_read_tokens,
+        session_cache_write_tokens=cache_write_tokens,
         session_prompt_tokens=prompt_tokens,
         session_completion_tokens=completion_tokens,
         session_total_tokens=total_tokens,
@@ -68,20 +78,19 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
-    def test_build_status_bar_text_shows_cost_when_enabled(self):
+    def test_build_status_bar_text_no_cost_in_status_bar(self):
         cli_obj = _attach_agent(
             _make_cli(),
             prompt_tokens=10000,
-            completion_tokens=2400,
-            total_tokens=12400,
+            completion_tokens=5000,
+            total_tokens=15000,
             api_calls=7,
-            context_tokens=12400,
+            context_tokens=50000,
             context_length=200_000,
         )
-        cli_obj.show_cost = True
 
         text = cli_obj._build_status_bar_text(width=120)
-        assert "$" in text  # cost is shown when enabled
+        assert "$" not in text  # cost is never shown in status bar
 
     def test_build_status_bar_text_collapses_for_narrow_terminal(self):
         cli_obj = _attach_agent(
@@ -128,8 +137,8 @@ class TestCLIUsageReport:
         output = capsys.readouterr().out
 
         assert "Model:" in output
-        assert "Input cost:" in output
-        assert "Output cost:" in output
+        assert "Cost status:" in output
+        assert "Cost source:" in output
         assert "Total cost:" in output
         assert "$" in output
         assert "0.064" in output
@@ -173,3 +182,94 @@ class TestCLIUsageReport:
         assert "Total cost:" in output
         assert "n/a" in output
         assert "Pricing unknown for glm-5" in output
+
+
+class TestStatusBarWidthSource:
+    """Ensure status bar fragments don't overflow the terminal width."""
+
+    def _make_wide_cli(self):
+        from datetime import datetime, timedelta
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=100_000,
+            completion_tokens=5_000,
+            total_tokens=105_000,
+            api_calls=20,
+            context_tokens=100_000,
+            context_length=200_000,
+        )
+        cli_obj._status_bar_visible = True
+        return cli_obj
+
+    def test_fragments_fit_within_announced_width(self):
+        """Total fragment text length must not exceed the width used to build them."""
+        from unittest.mock import MagicMock, patch
+        cli_obj = self._make_wide_cli()
+
+        for width in (40, 52, 76, 80, 120, 200):
+            mock_app = MagicMock()
+            mock_app.output.get_size.return_value = MagicMock(columns=width)
+
+            with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+                frags = cli_obj._get_status_bar_fragments()
+
+            total_text = "".join(text for _, text in frags)
+            assert len(total_text) <= width + 4, (  # +4 for minor padding chars
+                f"At width={width}, fragment total {len(total_text)} chars overflows "
+                f"({total_text!r})"
+            )
+
+    def test_fragments_use_pt_width_over_shutil(self):
+        """When prompt_toolkit reports a width, shutil.get_terminal_size must not be used."""
+        from unittest.mock import MagicMock, patch
+        cli_obj = self._make_wide_cli()
+
+        mock_app = MagicMock()
+        mock_app.output.get_size.return_value = MagicMock(columns=120)
+
+        with patch("prompt_toolkit.application.get_app", return_value=mock_app) as mock_get_app, \
+             patch("shutil.get_terminal_size") as mock_shutil:
+            cli_obj._get_status_bar_fragments()
+
+        mock_shutil.assert_not_called()
+
+    def test_fragments_fall_back_to_shutil_when_no_app(self):
+        """Outside a TUI context (no running app), shutil must be used as fallback."""
+        from unittest.mock import MagicMock, patch
+        cli_obj = self._make_wide_cli()
+
+        with patch("prompt_toolkit.application.get_app", side_effect=Exception("no app")), \
+             patch("shutil.get_terminal_size", return_value=MagicMock(columns=100)) as mock_shutil:
+            frags = cli_obj._get_status_bar_fragments()
+
+        mock_shutil.assert_called()
+        assert len(frags) > 0
+
+    def test_build_status_bar_text_uses_pt_width(self):
+        """_build_status_bar_text() must also prefer prompt_toolkit width."""
+        from unittest.mock import MagicMock, patch
+        cli_obj = self._make_wide_cli()
+
+        mock_app = MagicMock()
+        mock_app.output.get_size.return_value = MagicMock(columns=80)
+
+        with patch("prompt_toolkit.application.get_app", return_value=mock_app), \
+             patch("shutil.get_terminal_size") as mock_shutil:
+            text = cli_obj._build_status_bar_text()  # no explicit width
+
+        mock_shutil.assert_not_called()
+        assert isinstance(text, str)
+        assert len(text) > 0
+
+    def test_explicit_width_skips_pt_lookup(self):
+        """An explicit width= argument must bypass both PT and shutil lookups."""
+        from unittest.mock import patch
+        cli_obj = self._make_wide_cli()
+
+        with patch("prompt_toolkit.application.get_app") as mock_get_app, \
+             patch("shutil.get_terminal_size") as mock_shutil:
+            text = cli_obj._build_status_bar_text(width=100)
+
+        mock_get_app.assert_not_called()
+        mock_shutil.assert_not_called()
+        assert len(text) > 0
