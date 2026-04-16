@@ -4811,7 +4811,7 @@ class AIAgent:
             _msg_tok_est = estimate_messages_tokens_rough(messages)
             # Include tool schema tokens — with many tools these can add 20-30K+ tokens
             _tool_tok_est = estimate_tokens_rough(json.dumps(self.tools)) if self.tools else 0
-            _preflight_tokens=*** + _msg_tok_est + _tool_tok_est
+            _preflight_tokens = _sys_tok_est + _msg_tok_est + _tool_tok_est
 
             if _preflight_tokens >= self.context_compressor.threshold_tokens:
                 logger.info(

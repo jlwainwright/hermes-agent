@@ -142,12 +142,13 @@ def check_for_updates() -> Optional[int]:
     or ``None`` if the check fails or isn't applicable.
     """
     hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    repo_dir = hermes_home / "hermes-agent"
     cache_file = hermes_home / ".update_check"
 
-    # Must be a git repo — fall back to project root for dev installs
+    # Use the repo where the running code lives (consistent with cmd_update),
+    # falling back to the installed location if not a git repo (e.g. pip install).
+    repo_dir = Path(__file__).parent.parent.resolve()
     if not (repo_dir / ".git").exists():
-        repo_dir = Path(__file__).parent.parent.resolve()
+        repo_dir = hermes_home / "hermes-agent"
     if not (repo_dir / ".git").exists():
         return None
 

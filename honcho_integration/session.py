@@ -166,7 +166,14 @@ class HonchoSessionManager:
         user_config = SessionPeerConfig(observe_me=True, observe_others=True)
         ai_config = SessionPeerConfig(observe_me=True, observe_others=True)
 
-        session.add_peers([(user_peer, user_config), (assistant_peer, ai_config)])
+        try:
+            session.add_peers([(user_peer, user_config), (assistant_peer, ai_config)])
+        except Exception as _peers_exc:
+            logger.warning(
+                "Honcho add_peers timed out or failed for session '%s' — "
+                "continuing without peer observation: %s",
+                session_id, _peers_exc,
+            )
 
         # Load existing messages via context() - single call for messages + metadata
         existing_messages = []
