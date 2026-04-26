@@ -43,6 +43,20 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig
 
 logger = logging.getLogger(__name__)
+# Automated sender patterns — emails from these are silently ignored
+_NOREPLY_PATTERNS = (
+    "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+    "mailer-daemon", "postmaster", "bounce", "notifications@",
+    "automated@", "auto-confirm", "auto-reply", "automailer",
+)
+
+# RFC headers that indicate bulk/automated mail
+_AUTOMATED_HEADERS = {
+    "Auto-Submitted": lambda v: v.lower() != "no",
+    "Precedence": lambda v: v.lower() in ("bulk", "list", "junk"),
+    "X-Auto-Response-Suppress": lambda v: bool(v),
+    "List-Unsubscribe": lambda v: bool(v),
+}
 
 # Gmail-safe max length per email body
 MAX_MESSAGE_LENGTH = 50_000
@@ -50,7 +64,17 @@ MAX_MESSAGE_LENGTH = 50_000
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
-
+def _is_automated_sender(address: str, headers: dict) -> bool:
+    """Return True if this email is from an automated/noreply source."""
+    addr = address.lower()
+    if any(pattern in addr for pattern in _NOREPLY_PATTERNS):
+        return True
+    for header, check in _AUTOMATED_HEADERS.items():
+        value = headers.get(header, "")
+        if value and check(value):
+            return True
+    return False
+    
 def check_email_requirements() -> bool:
     """Check if email platform dependencies are available."""
     addr = os.getenv("EMAIL_ADDRESS")
@@ -171,7 +195,11 @@ def _extract_attachments(
 
         ext = Path(filename).suffix.lower()
         if ext in _IMAGE_EXTS:
-            cached_path = cache_image_from_bytes(payload, ext)
+            try:
+                cached_path = cache_image_from_bytes(payload, ext)
+            except ValueError:
+                logger.debug("Skipping non-image attachment %s (invalid magic bytes)", filename)
+                continue
             attachments.append({
                 "path": cached_path,
                 "filename": filename,
@@ -313,55 +341,63 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-            imap.login(self._address, self._password)
-            imap.select("INBOX")
+            try:
+                imap.login(self._address, self._password)
+                imap.select("INBOX")
 
-            status, data = imap.uid("search", None, "UNSEEN")
-            if status != "OK" or not data or not data[0]:
-                imap.logout()
-                return results
+                status, data = imap.uid("search", None, "UNSEEN")
+                if status != "OK" or not data or not data[0]:
+                    return results
 
-            for uid in data[0].split():
-                if uid in self._seen_uids:
-                    continue
-                self._seen_uids.add(uid)
-                # Trim periodically to prevent unbounded memory growth
-                if len(self._seen_uids) > self._seen_uids_max:
-                    self._trim_seen_uids()
+                for uid in data[0].split():
+                    if uid in self._seen_uids:
+                        continue
+                    self._seen_uids.add(uid)
+                    # Trim periodically to prevent unbounded memory growth
+                    if len(self._seen_uids) > self._seen_uids_max:
+                        self._trim_seen_uids()
 
-                status, msg_data = imap.uid("fetch", uid, "(RFC822)")
-                if status != "OK":
-                    continue
+                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    if status != "OK":
+                        continue
 
-                raw_email = msg_data[0][1]
-                msg = email_lib.message_from_bytes(raw_email)
+                    raw_email = msg_data[0][1]
+                    msg = email_lib.message_from_bytes(raw_email)
 
-                sender_raw = msg.get("From", "")
-                sender_addr = _extract_email_address(sender_raw)
-                sender_name = _decode_header_value(sender_raw)
-                # Remove email from name if present
-                if "<" in sender_name:
-                    sender_name = sender_name.split("<")[0].strip().strip('"')
+                    sender_raw = msg.get("From", "")
+                    sender_addr = _extract_email_address(sender_raw)
+                    sender_name = _decode_header_value(sender_raw)
+                    # Remove email from name if present
+                    if "<" in sender_name:
+                        sender_name = sender_name.split("<")[0].strip().strip('"')
 
-                subject = _decode_header_value(msg.get("Subject", "(no subject)"))
-                message_id = msg.get("Message-ID", "")
-                in_reply_to = msg.get("In-Reply-To", "")
-                body = _extract_text_body(msg)
-                attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
+                    subject = _decode_header_value(msg.get("Subject", "(no subject)"))
+                    message_id = msg.get("Message-ID", "")
+                    in_reply_to = msg.get("In-Reply-To", "")
+                    # Skip automated/noreply senders before any processing
+                    msg_headers = dict(msg.items())
+                    if _is_automated_sender(sender_addr, msg_headers):
+                        logger.debug("[Email] Skipping automated sender: %s", sender_addr)
+                        continue
+                    body = _extract_text_body(msg)
+                    attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
 
-                results.append({
-                    "uid": uid,
-                    "sender_addr": sender_addr,
-                    "sender_name": sender_name,
-                    "subject": subject,
-                    "message_id": message_id,
-                    "in_reply_to": in_reply_to,
-                    "body": body,
-                    "attachments": attachments,
-                    "date": msg.get("Date", ""),
-                })
-
-            imap.logout()
+                    results.append({
+                        "uid": uid,
+                        "sender_addr": sender_addr,
+                        "sender_name": sender_name,
+                        "subject": subject,
+                        "message_id": message_id,
+                        "in_reply_to": in_reply_to,
+                        "body": body,
+                        "attachments": attachments,
+                        "date": msg.get("Date", ""),
+                    })
+            finally:
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("[Email] IMAP fetch error: %s", e)
         return results
@@ -372,6 +408,11 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Skip self-messages
         if sender_addr == self._address.lower():
+            return
+
+        # Never reply to automated senders
+        if _is_automated_sender(sender_addr, {}):
+            logger.debug("[Email] Dropping automated sender at dispatch: %s", sender_addr)
             return
 
         subject = msg_data["subject"]
@@ -469,10 +510,15 @@ class EmailAdapter(BasePlatformAdapter):
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
         smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
-        smtp.starttls(context=ssl.create_default_context())
-        smtp.login(self._address, self._password)
-        smtp.send_message(msg)
-        smtp.quit()
+        try:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(self._address, self._password)
+            smtp.send_message(msg)
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                smtp.close()
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
@@ -499,6 +545,7 @@ class EmailAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
         try:
@@ -556,10 +603,15 @@ class EmailAdapter(BasePlatformAdapter):
             msg.attach(part)
 
         smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
-        smtp.starttls(context=ssl.create_default_context())
-        smtp.login(self._address, self._password)
-        smtp.send_message(msg)
-        smtp.quit()
+        try:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(self._address, self._password)
+            smtp.send_message(msg)
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                smtp.close()
 
         return msg_id
 

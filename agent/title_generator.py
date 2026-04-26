@@ -19,7 +19,7 @@ _TITLE_PROMPT = (
 )
 
 
-def generate_title(user_message: str, assistant_response: str, timeout: float = 15.0) -> Optional[str]:
+def generate_title(user_message: str, assistant_response: str, timeout: float = 30.0) -> Optional[str]:
     """Generate a session title from the first exchange.
 
     Uses the auxiliary LLM client (cheapest/fastest available model).
@@ -36,9 +36,9 @@ def generate_title(user_message: str, assistant_response: str, timeout: float = 
 
     try:
         response = call_llm(
-            task="compression",  # reuse compression task config (cheap/fast model)
+            task="title_generation",
             messages=messages,
-            max_tokens=30,
+            max_tokens=500,
             temperature=0.3,
             timeout=timeout,
         )
