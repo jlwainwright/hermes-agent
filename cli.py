@@ -3093,9 +3093,15 @@ class HermesCLI:
             model_short = f"{model_short[:23]}..."
 
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
+        try:
+            import socket as _socket
+            _hostname = _socket.gethostname().split(".")[0]
+        except Exception:
+            _hostname = ""
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "hostname": _hostname,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -3390,6 +3396,8 @@ class HermesCLI:
                 parts.append(prompt_elapsed)
             if yolo_active:
                 parts.append("⚠ YOLO")
+            if snapshot.get("hostname"):
+                parts.append(f"@{snapshot['hostname']}")
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -3484,6 +3492,9 @@ class HermesCLI:
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if snapshot.get("hostname"):
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", f"@{snapshot['hostname']}"))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
